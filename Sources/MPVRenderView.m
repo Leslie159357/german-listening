@@ -65,6 +65,8 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
 @property (nonatomic, assign) GLuint framebuffer;
 @property (nonatomic, assign) GLuint colorRenderbuffer;
 @property (nonatomic, assign) CGSize pixelSize;
+@property (nonatomic, strong) dispatch_queue_t renderQueue;
+@property (nonatomic, assign) BOOL needsResize;
 @property (nonatomic, assign) BOOL ready;
 @end
 
@@ -78,6 +80,7 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
     self = [super initWithFrame:frame];
     if (!self) { return nil; }
     _mpvHandle = handle;
+    _renderQueue = dispatch_queue_create("xyz.1122275.mpv.render", DISPATCH_QUEUE_SERIAL);
     self.opaque = YES;
     self.backgroundColor = [UIColor blackColor];
     CAEAGLLayer *layer = (CAEAGLLayer *)self.layer;
@@ -104,8 +107,8 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
 - (void)layoutSubviews {
     [super layoutSubviews];
     [self setupGLIfNeeded];
-    [self resizeDrawable];
-    if (self.ready) { [self drawFrame]; }
+    if (!self.ready) { return; }
+    dispatch_async(self.renderQueue, ^{ [self resizeDrawable]; [self drawFrame]; });
 }
 
 - (void)setupGLIfNeeded {
@@ -155,17 +158,21 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
 
     __weak MPVRenderView *weakSelf = self;
     mpv_render_context_set_update_callback(ctx, mpvRenderUpdate, (__bridge void *)weakSelf);
+    // The render queue takes over the context; do not leave it current on the main thread.
     self.ready = YES;
+    [EAGLContext setCurrentContext:nil];
     if (self.onReady) { self.onReady(); }
 }
 
 static void mpvRenderUpdate(void *cb_ctx) {
     // cb_ctx is unretained: resolve weakly so a dying view cannot be messaged.
     __weak MPVRenderView *weakView = (__bridge MPVRenderView *)cb_ctx;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        MPVRenderView *view = weakView;
-        if (!view || !view.ready) { return; }
-        [view drawFrame];
+    MPVRenderView *view = weakView;
+    if (!view || !view.ready || view.renderQueue == nil) { return; }
+    dispatch_async(view.renderQueue, ^{
+        MPVRenderView *strongView = weakView;
+        if (!strongView || !strongView.ready) { return; }
+        [strongView drawFrame];
     });
 }
 

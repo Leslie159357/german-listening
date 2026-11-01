@@ -26,11 +26,29 @@ struct PlayerView: View {
         }
         .navigationTitle(item.title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button("记录视频参数") { engine.logVideoParameters() }
+                    Divider()
+                    Button("硬解：开") { engine.setHardwareDecoding(true) }
+                    Button("硬解：关") { engine.setHardwareDecoding(false) }
+                    Divider()
+                    Button("音调映射：自动") { engine.setToneMapping("auto") }
+                    Button("音调映射：裁剪") { engine.setToneMapping("clip") }
+                    Button("音调映射：关闭") { engine.setToneMapping("no") }
+                } label: {
+                    Image(systemName: "wrench.and.screwdriver")
+                }
+            }
+        }
         .task(id: item.id) {
             guard !hasLoaded else { return }
             hasLoaded = true
             engine.load(url: store.mediaURL(for: item), startAt: item.lastPosition)
             syncIndex(time: item.lastPosition)
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            engine.logVideoParameters()
         }
         .onDisappear {
             store.updatePosition(item.id, position: engine.time)

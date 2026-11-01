@@ -92,6 +92,7 @@ final class MPVEngine: ObservableObject {
             return
         }
         rawHandle = UnsafeMutableRawPointer(ctx)
+        Self.sharedHandle = ctx
     }
 
     // MARK: - Renderer handshake
@@ -154,6 +155,7 @@ final class MPVEngine: ObservableObject {
             self.ctx = nil
         }
         rawHandle = nil
+        Self.sharedHandle = nil
         state = .idle
     }
 
@@ -202,6 +204,35 @@ final class MPVEngine: ObservableObject {
         if rc < 0 { pendingSeek = seconds }
     }
 
+    // MARK: - Runtime switches (for narrowing down colour / performance issues on device)
+
+    func setHardwareDecoding(_ enabled: Bool) {
+        let rc = setProperty("hwdec", enabled ? "videotoolbox" : "no")
+        AppLog.shared.log("硬解 → \(enabled ? "开" : "关") rc=\(rc)")
+    }
+
+    func setToneMapping(_ mode: String) {
+        _ = setProperty("tone-mapping", mode)
+        _ = setProperty("target-peak", "100")
+        AppLog.shared.log("音调映射 → \(mode)")
+    }
+
+    /// Dumps what mpv thinks the source is; distinguishes HDR/colour-space issues from channel swaps.
+    func logVideoParameters() {
+        let keys = ["video-params/primaries", "video-params/gamma", "video-params/sig-peak",
+                    "video-params/colorlevels", "video-params/pixelformat", "video-params/w",
+                    "video-params/h", "hwdec-current", "video-codec", "colorspace"]
+        let summary = keys.map { "\($0)=\(Self.readPropertyString($0) ?? "-")" }.joined(separator: " ")
+        AppLog.shared.log("视频参数 " + summary)
+    }
+
+    nonisolated(unsafe) static var sharedHandle: OpaquePointer?
+
+    private static func readPropertyString(_ name: String) -> String? {
+        guard let handle = sharedHandle else { return nil }
+        return readProperty(handle, name)
+    }
+
     func setSpeed(_ speed: Double) {
         _ = setProperty("speed", String(format: "%.2f", max(0.25, min(4.0, speed))))
     }
@@ -211,7 +242,7 @@ final class MPVEngine: ObservableObject {
     private func startPolling() {
         guard pollTimer == nil, let handle = ctx else { return }
         let timer = DispatchSource.makeTimerSource(queue: pollQueue)
-        timer.schedule(deadline: .now() + 0.1, repeating: 0.1, leeway: .milliseconds(20))
+        timer.schedule(deadline: .now() + 0.2, repeating: 0.2, leeway: .milliseconds(40))
         timer.setEventHandler { [weak self] in
             guard let self, !self.shuttingDown else { return }
             let pos = Self.readProperty(handle, "time-pos").flatMap(Double.init)
