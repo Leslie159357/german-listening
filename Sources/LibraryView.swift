@@ -7,6 +7,7 @@ struct LibraryView: View {
     @ObservedObject private var log = AppLog.shared
 
     @State private var showFileImporter = false
+    @State private var showDocPicker = false
     @State private var showPhotosPicker = false
     @State private var photoSelection: [PhotosPickerItem] = []
     @State private var selected: MediaItem?
@@ -106,23 +107,16 @@ struct LibraryView: View {
                     log.log("相册导入结束：\(report.summary)")
                 }
             }
-            .fileImporter(isPresented: $showFileImporter,
-                          allowedContentTypes: [.item],
-                          allowsMultipleSelection: true) { result in
-                log.log("文件选择器回调触发")
-                switch result {
-                case .success(let urls):
+            .sheet(isPresented: $showDocPicker) {
+                DocumentPicker { urls in
+                    showDocPicker = false
                     log.log("选中 \(urls.count) 个文件")
                     for url in urls { log.log("  · \(url.lastPathComponent)") }
                     let outcome = store.importSelection(urls)
                     log.log("导入结果：\(outcome.summary)")
                     report = outcome
-                case .failure(let error):
-                    log.log("选择器失败：\(error.localizedDescription)")
-                    var failed = LibraryStore.ImportReport()
-                    failed.failures = ["选择文件失败：\(error.localizedDescription)"]
-                    report = failed
                 }
+                .ignoresSafeArea()
             }
             .alert("导入结果", isPresented: Binding(get: { report != nil },
                                                  set: { if !$0 { report = nil } })) {
@@ -145,7 +139,7 @@ struct LibraryView: View {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 350_000_000)
             switch picker {
-            case .files: showFileImporter = true
+            case .files: showDocPicker = true
             case .photos: showPhotosPicker = true
             }
             log.log("已请求弹出\(picker == .files ? "文件选择器" : "相册选择器")")

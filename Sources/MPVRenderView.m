@@ -191,10 +191,11 @@ static void mpvRenderUpdate(void *cb_ctx) {
     glClear(GL_COLOR_BUFFER_BIT);
 
     // EAGL has no default framebuffer: drawing into 0 paints into nothing.
+    // internal_format 0 = unknown, let mpv query it; a wrong hint can swap colour channels.
     mpv_opengl_fbo fbo = { (int)self.framebuffer,
                            (int)self.pixelSize.width,
                            (int)self.pixelSize.height,
-                           GL_RGBA8 };
+                           0 };
     int flipY = 1;
     mpv_render_param params[] = {
         { MPV_RENDER_PARAM_OPENGL_FBO, &fbo },

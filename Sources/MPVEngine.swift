@@ -75,6 +75,12 @@ final class MPVEngine: ObservableObject {
         _ = setOption("gpu-api", "opengl")
         _ = setOption("ao", "audiounit")
         _ = setOption("hwdec", "videotoolbox")
+        // iPhone screen recordings are often HDR (BT.2020/PQ); without tonemapping they render
+        // washed out or with shifted hues into an SDR framebuffer.
+        _ = setOption("tone-mapping", "auto")
+        _ = setOption("hdr-compute-peak", "no")
+        _ = setOption("target-peak", "100")
+        _ = setOption("target-colorspace-hint", "no")
         _ = setOption("audio-pitch-correction", "yes")
         _ = setOption("hr-seek", "yes")
         _ = c_mpv_request_log_messages(ctx, "warn")
