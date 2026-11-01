@@ -24,6 +24,9 @@ private func c_mpv_get_property_string(_ ctx: OpaquePointer?, _ name: UnsafePoin
 @_silgen_name("mpv_error_string")
 private func c_mpv_error_string(_ error: Int32) -> UnsafePointer<CChar>?
 
+@_silgen_name("mpv_request_log_messages")
+private func c_mpv_request_log_messages(_ ctx: OpaquePointer?, _ level: UnsafePointer<CChar>) -> Int32
+
 @_silgen_name("mpv_free")
 private func c_mpv_free(_ data: UnsafeMutableRawPointer?)
 
@@ -35,7 +38,9 @@ enum EngineState: String {
 }
 
 /// Control-plane wrapper around libmpv.
-/// v0.1 has no render surface: audio-only playback plus an exact clock.
+/// The video surface is an MPVRenderView created on top of `rawHandle`; nothing is loaded
+/// until that surface reports a live render context, otherwise vo=libmpv has no context and
+/// playback starts with audio only.
 @MainActor
 final class MPVEngine: ObservableObject {
     @Published private(set) var state: EngineState = .idle
@@ -43,44 +48,106 @@ final class MPVEngine: ObservableObject {
     @Published private(set) var duration: Double = 0
     @Published private(set) var lastError: String?
 
-    private var ctx: OpaquePointer?
-
-    /// Raw mpv_handle for the render surface; nil once shut down.
     nonisolated(unsafe) private(set) var rawHandle: UnsafeMutableRawPointer?
+
+    private var ctx: OpaquePointer?
     private var pollTimer: DispatchSourceTimer?
     private let pollQueue = DispatchQueue(label: "xyz.1122275.mpv.poll", qos: .utility)
     private var pendingSeek: Double?
 
+    private var rendererReady = false
+    private var pendingLoad: (url: URL, start: Double)?
+    private var detachHandler: (() -> Void)?
+    nonisolated(unsafe) private var shuttingDown = false
+
     init() {
         configureAudioSession()
         ctx = c_mpv_create()
-        guard let ctx else { state = .failed; lastError = "mpv_create returned nil"; return }
-        rawHandle = UnsafeMutableRawPointer(ctx)
+        guard let ctx else {
+            state = .failed
+            lastError = "mpv_create returned nil"
+            return
+        }
         _ = setOption("idle", "yes")
         _ = setOption("terminal", "no")
         _ = setOption("config", "no")
-        _ = setOption("vo", "gpu")           // rendered by MPVRenderView through the render API
+        _ = setOption("vo", "libmpv")          // render API consumer; "gpu" has no iOS context
         _ = setOption("gpu-api", "opengl")
         _ = setOption("ao", "audiounit")
+        _ = setOption("hwdec", "videotoolbox")
         _ = setOption("audio-pitch-correction", "yes")
         _ = setOption("hr-seek", "yes")
+        _ = c_mpv_request_log_messages(ctx, "warn")
+
         let rc = c_mpv_initialize(ctx)
         if rc < 0 {
             state = .failed
             lastError = errorText("mpv_initialize", rc)
+            return
+        }
+        rawHandle = UnsafeMutableRawPointer(ctx)
+    }
+
+    // MARK: - Renderer handshake
+
+    /// Called by the surface so shutdown can free the render context first.
+    func registerRenderer(detach: @escaping () -> Void) {
+        detachHandler = detach
+    }
+
+    func rendererDidBecomeReady() {
+        rendererReady = true
+        if let pending = pendingLoad {
+            pendingLoad = nil
+            performLoad(url: pending.url, startAt: pending.start)
         }
     }
 
-    /// Timer.invalidate and mpv_terminate_destroy must both run on the thread that owns the runloop.
+    func reportRenderFailure(_ reason: String) {
+        lastError = "渲染层: \(reason)"
+    }
+
+    func load(url: URL, startAt: Double = 0) {
+        guard ctx != nil else { return }
+        guard rendererReady else {
+            pendingLoad = (url, startAt)
+            state = .loading
+            return
+        }
+        performLoad(url: url, startAt: startAt)
+    }
+
+    /// `start=` is a loadfile option (mpv 0.35+): no seek-before-FILE_LOADED race.
+    private func performLoad(url: URL, startAt: Double) {
+        state = .loading
+        lastError = nil
+        let rc = command(["loadfile", url.path, "replace", "0", String(format: "start=%.3f", max(0, startAt))])
+        if rc < 0 {
+            fail("loadfile", rc)
+            return
+        }
+        _ = setProperty("pause", "no")
+        state = .playing
+        startPolling()
+    }
+
+    /// Frees the render context first, then drains the poll queue before destroying the core.
     func shutdown() {
+        guard !shuttingDown else { return }
+        shuttingDown = true
+        detachHandler?()
+        detachHandler = nil
+
         pollTimer?.setEventHandler {}
         pollTimer?.cancel()
         pollTimer = nil
+        pollQueue.sync {}          // let an in-flight get_property finish
+
         if let ctx {
             c_mpv_terminate_destroy(ctx)
             self.ctx = nil
-            rawHandle = nil
         }
+        rawHandle = nil
         state = .idle
     }
 
@@ -92,32 +159,19 @@ final class MPVEngine: ObservableObject {
         return name.withCString { n in value.withCString { v in c_mpv_set_option_string(ctx, n, v) } }
     }
 
-    /// Array form: no string escaping problems with paths containing quotes or backslashes.
     @discardableResult
     private func command(_ args: [String]) -> Int32 {
         guard let ctx else { return -1 }
-        var pointers = args.map { strdup($0) }
+        let pointers = args.map { strdup($0) }
         defer { pointers.forEach { free($0) } }
-        var argv: [UnsafePointer<CChar>?] = pointers.compactMap { pointer in
-            pointer.map { UnsafePointer($0) }
-        }
+        var argv: [UnsafePointer<CChar>?] = pointers.compactMap { pointer in pointer.map { UnsafePointer($0) } }
         argv.append(nil)
-        return argv.withUnsafeBufferPointer { buffer in
-            c_mpv_command(ctx, buffer.baseAddress)
-        }
+        return argv.withUnsafeBufferPointer { buffer in c_mpv_command(ctx, buffer.baseAddress) }
     }
 
     private func setProperty(_ name: String, _ value: String) -> Int32 {
         guard let ctx else { return -1 }
         return name.withCString { n in value.withCString { v in c_mpv_set_property_string(ctx, n, v) } }
-    }
-
-    private func readProperty(_ name: String) -> String? {
-        guard let ctx else { return nil }
-        let value = name.withCString { c_mpv_get_property_string(ctx, $0) }
-        defer { if let value { c_mpv_free(value) } }
-        guard let value else { return nil }
-        return String(cString: value)
     }
 
     private func errorText(_ what: String, _ rc: Int32) -> String {
@@ -132,42 +186,14 @@ final class MPVEngine: ObservableObject {
 
     // MARK: - Transport
 
-    /// `start=` is a loadfile option (mpv 0.35+): the file opens at that position,
-    /// avoiding the "seek before FILE_LOADED is dropped" race of seek-after-loadfile.
-    func load(url: URL, startAt: Double = 0) {
-        if ctx == nil { return }
-        state = .loading
-        lastError = nil
-        let rc = command(["loadfile", url.path, "replace", "0", String(format: "start=%.3f", max(0, startAt))])
-        if rc < 0 {
-            fail("loadfile", rc)
-            return
-        }
-        _ = setProperty("pause", "no")
-        state = .playing
-        startPolling()
-    }
-
-    func play() {
-        if setProperty("pause", "no") >= 0 { state = .playing }
-    }
-
-    func pause() {
-        if setProperty("pause", "yes") >= 0 { state = .paused }
-    }
-
-    func togglePlay() {
-        state == .paused ? play() : pause()
-    }
+    func play() { if setProperty("pause", "no") >= 0 { state = .playing } }
+    func pause() { if setProperty("pause", "yes") >= 0 { state = .paused } }
+    func togglePlay() { state == .paused ? play() : pause() }
 
     func seek(to seconds: Double) {
         time = seconds
         let rc = command(["seek", String(format: "%.3f", seconds), "absolute+exact"])
-        if rc < 0 { pendingSeek = seconds }   // retry once the file reports loaded
-    }
-
-    func reportRenderFailure(_ reason: String) {
-        lastError = "渲染层: \(reason)"
+        if rc < 0 { pendingSeek = seconds }
     }
 
     func setSpeed(_ speed: Double) {
@@ -181,11 +207,12 @@ final class MPVEngine: ObservableObject {
         let timer = DispatchSource.makeTimerSource(queue: pollQueue)
         timer.schedule(deadline: .now() + 0.1, repeating: 0.1, leeway: .milliseconds(20))
         timer.setEventHandler { [weak self] in
-            guard let self else { return }
+            guard let self, !self.shuttingDown else { return }
             let pos = Self.readProperty(handle, "time-pos").flatMap(Double.init)
             let dur = Self.readProperty(handle, "duration").flatMap(Double.init)
             let paused = Self.readProperty(handle, "pause") == "true"
             DispatchQueue.main.async {
+                guard !self.shuttingDown else { return }
                 self.apply(pos: pos, duration: dur, paused: paused)
             }
         }
@@ -207,7 +234,6 @@ final class MPVEngine: ObservableObject {
             _ = command(["seek", String(format: "%.3f", pendingSeek), "absolute+exact"])
             self.pendingSeek = nil
         }
-        // state follows mpv, never the optimistic button press
         if paused, state == .playing { state = .paused }
         if !paused, state == .paused || state == .loading { state = .playing }
     }

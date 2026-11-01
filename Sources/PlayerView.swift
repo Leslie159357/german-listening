@@ -51,9 +51,10 @@ struct PlayerView: View {
     @ViewBuilder
     private var videoSurface: some View {
         if let handle = engine.rawHandle {
-            MPVSurface(handle: handle) { reason in
-                engine.reportRenderFailure(reason)
-            }
+            MPVSurface(handle: handle,
+                       onReady: { engine.rendererDidBecomeReady() },
+                       onFailure: { engine.reportRenderFailure($0) },
+                       onDetach: { engine.registerRenderer(detach: $0) })
             .aspectRatio(16.0 / 9.0, contentMode: .fit)
             .background(Color.black)
         } else {
@@ -203,13 +204,21 @@ struct SentenceListView: View, Equatable {
 /// Bridges the Objective-C render view into SwiftUI.
 struct MPVSurface: UIViewRepresentable {
     let handle: UnsafeMutableRawPointer
+    let onReady: () -> Void
     let onFailure: (String) -> Void
+    let onDetach: (@escaping () -> Void) -> Void
 
     func makeUIView(context: Context) -> MPVRenderView {
         let view = MPVRenderView(frame: .zero, mpvHandle: handle)
+        view.onReady = onReady
         view.onFailure = onFailure
+        onDetach { [weak view] in view?.detachRenderer() }
         return view
     }
 
     func updateUIView(_ uiView: MPVRenderView, context: Context) {}
+
+    static func dismantleUIView(_ uiView: MPVRenderView, coordinator: ()) {
+        uiView.detachRenderer()
+    }
 }

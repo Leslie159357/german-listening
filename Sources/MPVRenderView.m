@@ -7,7 +7,6 @@
 // libmpv render API, declared locally: MPVKit ships binary frameworks without public headers.
 typedef void mpv_handle;
 typedef struct mpv_render_context mpv_render_context;
-
 typedef struct { int type; void *data; } mpv_render_param;
 
 typedef struct {
@@ -32,7 +31,8 @@ enum {
     MPV_RENDER_PARAM_FLIP_Y = 4,
 };
 
-extern mpv_render_context *mpv_render_context_create(mpv_render_context **res, mpv_handle *ctx, mpv_render_param *params);
+// return type is int (error code); the context comes back through the first argument
+extern int mpv_render_context_create(mpv_render_context **res, void *mpv, mpv_render_param *params);
 extern int mpv_render_context_render(mpv_render_context *ctx, mpv_render_param *params);
 extern void mpv_render_context_set_update_callback(mpv_render_context *ctx, mpv_render_update_fn callback, void *callback_ctx);
 extern void mpv_render_context_free(mpv_render_context *ctx);
@@ -44,14 +44,21 @@ static void mpvRenderUpdate(void *cb_ctx);
 
 static void *mpv_get_proc_address(void *ctx, const char *name) {
     (void)ctx;
-    return dlsym(RTLD_DEFAULT, name);
+    void *symbol = dlsym(RTLD_DEFAULT, name);
+    if (symbol) { return symbol; }
+    // Fallback for symbols not exported to the global namespace.
+    CFBundleRef bundle = CFBundleGetBundleWithIdentifier(CFSTR("com.apple.opengles"));
+    if (bundle) { return CFBundleGetFunctionPointerForName(bundle, (__bridge CFStringRef)[NSString stringWithUTF8String:name]); }
+    return NULL;
 }
 
-@interface MPVRenderView ()
+@interface MPVRenderView () {
+    BOOL _setupTried;
+}
 - (void)drawFrame;
 - (void)setupGL;
 - (void)resizeDrawable;
-- (void)detachRenderer;
+
 @property (nonatomic, assign) void *mpvHandle;
 @property (nonatomic, assign) mpv_render_context *renderContext;
 @property (nonatomic, strong) EAGLContext *glContext;
@@ -79,27 +86,43 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
         kEAGLDrawablePropertyRetainedBacking: @NO,
         kEAGLDrawablePropertyColorFormat: kEAGLColorFormatRGBA8
     };
-    layer.contentsScale = [UIScreen mainScreen].scale;
     return self;
+}
+
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    if (self.window) {
+        [self setupGLIfNeeded];
+    } else {
+        // Leaving the hierarchy: stop mpv from calling back into a view that may go away.
+        if (self.renderContext) {
+            mpv_render_context_set_update_callback(self.renderContext, NULL, NULL);
+        }
+    }
 }
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    if (!self.ready) { [self setupGL]; }
+    [self setupGLIfNeeded];
     [self resizeDrawable];
+    if (self.ready) { [self drawFrame]; }
+}
+
+- (void)setupGLIfNeeded {
+    if (self.ready || _setupTried) { return; }
+    _setupTried = YES;              // attempt exactly once: a failure must not leak GL objects
+    [self setupGL];
 }
 
 - (void)setupGL {
-    if (self.ready || self.mpvHandle == NULL) { return; }
-
+    if (self.mpvHandle == NULL) {
+        [self reportFailure:@"mpv handle 为空"];
+        return;
+    }
     self.glContext = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES3];
-    if (!self.glContext) {
-        self.glContext = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
-    }
+    if (!self.glContext) { self.glContext = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2]; }
     if (!self.glContext) { [self reportFailure:@"EAGLContext 创建失败"]; return; }
-    if (![EAGLContext setCurrentContext:self.glContext]) {
-        [self reportFailure:@"EAGLContext 无法激活"]; return;
-    }
+    if (![EAGLContext setCurrentContext:self.glContext]) { [self reportFailure:@"EAGLContext 无法激活"]; return; }
 
     glGenFramebuffers(1, &_framebuffer);
     glBindFramebuffer(GL_FRAMEBUFFER, self.framebuffer);
@@ -107,6 +130,7 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
     glBindRenderbuffer(GL_RENDERBUFFER, self.colorRenderbuffer);
 
     CAEAGLLayer *layer = (CAEAGLLayer *)self.layer;
+    layer.contentsScale = self.traitCollection.displayScale > 0 ? self.traitCollection.displayScale : 2.0;
     if (![self.glContext renderbufferStorage:GL_RENDERBUFFER fromDrawable:layer]) {
         [self reportFailure:@"renderbufferStorage 失败"]; return;
     }
@@ -124,25 +148,29 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
     mpv_render_context *ctx = NULL;
     int rc = mpv_render_context_create(&ctx, self.mpvHandle, params);
     if (rc < 0 || ctx == NULL) {
-        [self reportFailure:[NSString stringWithFormat:@"mpv render init 失败 (rc=%d)", rc]];
+        [self reportFailure:[NSString stringWithFormat:@"mpv render init 失败 (rc=%d) —— 多半是 vo 不是 libmpv 或 GL 版本不足", rc]];
         return;
     }
     self.renderContext = ctx;
 
     __weak MPVRenderView *weakSelf = self;
-    mpv_render_context_set_update_callback(ctx, (mpv_render_update_fn)mpvRenderUpdate, (__bridge void *)weakSelf);
+    mpv_render_context_set_update_callback(ctx, mpvRenderUpdate, (__bridge void *)weakSelf);
     self.ready = YES;
+    if (self.onReady) { self.onReady(); }
 }
 
 static void mpvRenderUpdate(void *cb_ctx) {
-    MPVRenderView *view = (__bridge MPVRenderView *)cb_ctx;
+    // cb_ctx is unretained: resolve weakly so a dying view cannot be messaged.
+    __weak MPVRenderView *weakView = (__bridge MPVRenderView *)cb_ctx;
     dispatch_async(dispatch_get_main_queue(), ^{
+        MPVRenderView *view = weakView;
+        if (!view || !view.ready) { return; }
         [view drawFrame];
     });
 }
 
 - (void)resizeDrawable {
-    if (!self.ready) { return; }
+    if (!self.ready || !self.glContext) { return; }
     [EAGLContext setCurrentContext:self.glContext];
     glBindRenderbuffer(GL_RENDERBUFFER, self.colorRenderbuffer);
     CAEAGLLayer *layer = (CAEAGLLayer *)self.layer;
@@ -154,13 +182,19 @@ static void mpvRenderUpdate(void *cb_ctx) {
 }
 
 - (void)drawFrame {
-    if (!self.ready || self.renderContext == NULL) { return; }
+    if (!self.ready || self.renderContext == NULL || !self.glContext) { return; }
     if (self.pixelSize.width < 1 || self.pixelSize.height < 1) { return; }
     if (![EAGLContext setCurrentContext:self.glContext]) { return; }
 
     glBindFramebuffer(GL_FRAMEBUFFER, self.framebuffer);
+    glClearColor(0.f, 0.f, 0.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
 
-    mpv_opengl_fbo fbo = { 0, (int)self.pixelSize.width, (int)self.pixelSize.height, GL_RGBA8 };
+    // EAGL has no default framebuffer: drawing into 0 paints into nothing.
+    mpv_opengl_fbo fbo = { (int)self.framebuffer,
+                           (int)self.pixelSize.width,
+                           (int)self.pixelSize.height,
+                           GL_RGBA8 };
     int flipY = 1;
     mpv_render_param params[] = {
         { MPV_RENDER_PARAM_OPENGL_FBO, &fbo },
@@ -184,17 +218,23 @@ static void mpvRenderUpdate(void *cb_ctx) {
 
 - (void)detachRenderer {
     if (self.renderContext) {
+        [EAGLContext setCurrentContext:self.glContext];   // mpv requires the creating context to be current
         mpv_render_context_set_update_callback(self.renderContext, NULL, NULL);
         mpv_render_context_free(self.renderContext);
         self.renderContext = NULL;
     }
     self.ready = NO;
+    self.mpvHandle = NULL;
 }
 
 - (void)dealloc {
     [self detachRenderer];
-    if (_framebuffer) { glDeleteFramebuffers(1, &_framebuffer); }
-    if (_colorRenderbuffer) { glDeleteRenderbuffers(1, &_colorRenderbuffer); }
+    if (_framebuffer || _colorRenderbuffer) {
+        [EAGLContext setCurrentContext:self.glContext];
+        if (_framebuffer) { glDeleteFramebuffers(1, &_framebuffer); }
+        if (_colorRenderbuffer) { glDeleteRenderbuffers(1, &_colorRenderbuffer); }
+        [EAGLContext setCurrentContext:nil];
+    }
 }
 
 @end
