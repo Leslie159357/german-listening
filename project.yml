@@ -23,26 +23,51 @@ targets:
       path: Support/Info.plist
       properties:
         CFBundleDisplayName: 精听
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.7.0"
+        CFBundleVersion: "7"
         UILaunchScreen: {}
         UIBackgroundModes: [audio]
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        NSMicrophoneUsageDescription: 跟读练习需要录音，用于回放对比自己的发音。
+        NSSpeechRecognitionUsageDescription: 跟读评分需要识别你的发音并给出客观反馈。
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: xyz.1122275.srt
+            UTTypeDescription: SubRip 字幕
+            UTTypeConformsTo: [public.plain-text]
+            UTTypeTagSpecification:
+              public.filename-extension: [srt]
+              public.mime-type: application/x-subrip
+          - UTTypeIdentifier: xyz.1122275.vtt
+            UTTypeDescription: WebVTT 字幕
+            UTTypeConformsTo: [public.plain-text]
+            UTTypeTagSpecification:
+              public.filename-extension: [vtt]
+              public.mime-type: text/vtt
+          - UTTypeIdentifier: xyz.1122275.ass
+            UTTypeDescription: ASS/SSA 字幕
+            UTTypeConformsTo: [public.plain-text]
+            UTTypeTagSpecification:
+              public.filename-extension: [ass, ssa]
+          - UTTypeIdentifier: xyz.1122275.mkv
+            UTTypeDescription: Matroska 视频
+            UTTypeConformsTo: [public.movie]
+            UTTypeTagSpecification:
+              public.filename-extension: [mkv, webm]
         CFBundleDocumentTypes:
-          - CFBundleTypeName: Video
-            CFBundleTypeRole: Editor
+          - CFBundleTypeName: 视频
+            CFBundleTypeRole: Viewer
             LSHandlerRank: Alternate
-            LSItemContentTypes: [public.movie, public.mpeg-4, public.audiovisual-content]
-          - CFBundleTypeName: Audio
-            CFBundleTypeRole: Editor
+            LSItemContentTypes: [public.movie, public.mpeg-4, xyz.1122275.mkv]
+          - CFBundleTypeName: 音频
+            CFBundleTypeRole: Viewer
             LSHandlerRank: Alternate
-            LSItemContentTypes: [public.audio, public.mp3, public.mpeg-4-audio]
-          - CFBundleTypeName: Subtitle
-            CFBundleTypeRole: Editor
+            LSItemContentTypes: [public.audio, public.mp3]
+          - CFBundleTypeName: 字幕
+            CFBundleTypeRole: Viewer
             LSHandlerRank: Alternate
-            LSItemContentTypes: [public.plain-text, public.text]
+            LSItemContentTypes: [xyz.1122275.srt, xyz.1122275.vtt, xyz.1122275.ass]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: xyz.1122275.germanlistening

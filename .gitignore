@@ -2,4 +2,4 @@
 *.xcodeproj/
 *.xcworkspace/
 Support/Info.plist
-Package.resolved
+
