@@ -1,0 +1,53 @@
+name: ios-unsigned-ipa
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain (list Xcodes)
+        run: |
+          ls /Applications | grep -i xcode || true
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Archive (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project GermanListening.xcodeproj \
+            -scheme GermanListening \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/GermanListening.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            -quiet
+
+      - name: Package IPA
+        run: |
+          APP="$RUNNER_TEMP/GermanListening.xcarchive/Products/Applications/GermanListening.app"
+          ls -la "$(dirname "$APP")"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP" && zip -qry GermanListening-unsigned.ipa Payload
+          shasum -a 256 GermanListening-unsigned.ipa
+          du -h GermanListening-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GermanListening-ipa
+          path: ${{ runner.temp }}/GermanListening-unsigned.ipa
+          if-no-files-found: error
