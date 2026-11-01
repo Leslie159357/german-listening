@@ -12,6 +12,37 @@ final class LibraryStore: ObservableObject {
     private var mediaDir: URL { documents.appendingPathComponent("Media", isDirectory: true) }
     private var libraryURL: URL { documents.appendingPathComponent("library.json") }
 
+    private static let subtitleExtensions: Set<String> = ["srt", "vtt", "ass", "ssa"]
+
+    private func isSubtitle(_ url: URL) -> Bool {
+        Self.subtitleExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    private func isMedia(_ url: URL) -> Bool {
+        !isSubtitle(url)
+    }
+
+    /// Case/space/punctuation-insensitive key, so a hand-renamed subtitle still pairs.
+    static func normalized(_ name: String) -> String {
+        let lowered = name.lowercased().folding(options: .diacriticInsensitive, locale: .current)
+        return lowered.filter { $0.isLetter || $0.isNumber }
+    }
+
+    /// Handles a file handed over by another app (115, Files, AirDrop). The URL is
+    /// security-scoped and dies with this call, so copy immediately.
+    @discardableResult
+    func handleIncoming(_ url: URL) -> MediaItem? {
+        do {
+            let item = try importMedia(from: url, candidates: [])
+            AppLog.shared.log("外部打开 \(url.lastPathComponent) → \(item?.title ?? "-")")
+            return item
+        } catch {
+            lastError = "接收文件失败：\(error.localizedDescription)"
+            AppLog.shared.log("外部打开失败：\(error.localizedDescription)")
+            return nil
+        }
+    }
+
     init() {
         try? fm.createDirectory(at: mediaDir, withIntermediateDirectories: true)
         load()
