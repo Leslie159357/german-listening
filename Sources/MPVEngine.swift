@@ -44,6 +44,9 @@ final class MPVEngine: ObservableObject {
     @Published private(set) var lastError: String?
 
     private var ctx: OpaquePointer?
+
+    /// Raw mpv_handle for the render surface; nil once shut down.
+    nonisolated(unsafe) private(set) var rawHandle: UnsafeMutableRawPointer?
     private var pollTimer: DispatchSourceTimer?
     private let pollQueue = DispatchQueue(label: "xyz.1122275.mpv.poll", qos: .utility)
     private var pendingSeek: Double?
@@ -52,10 +55,12 @@ final class MPVEngine: ObservableObject {
         configureAudioSession()
         ctx = c_mpv_create()
         guard let ctx else { state = .failed; lastError = "mpv_create returned nil"; return }
+        rawHandle = UnsafeMutableRawPointer(ctx)
         _ = setOption("idle", "yes")
         _ = setOption("terminal", "no")
         _ = setOption("config", "no")
-        _ = setOption("vo", "null")          // render layer arrives in v0.2
+        _ = setOption("vo", "gpu")           // rendered by MPVRenderView through the render API
+        _ = setOption("gpu-api", "opengl")
         _ = setOption("ao", "audiounit")
         _ = setOption("audio-pitch-correction", "yes")
         _ = setOption("hr-seek", "yes")
@@ -74,6 +79,7 @@ final class MPVEngine: ObservableObject {
         if let ctx {
             c_mpv_terminate_destroy(ctx)
             self.ctx = nil
+            rawHandle = nil
         }
         state = .idle
     }
@@ -158,6 +164,10 @@ final class MPVEngine: ObservableObject {
         time = seconds
         let rc = command(["seek", String(format: "%.3f", seconds), "absolute+exact"])
         if rc < 0 { pendingSeek = seconds }   // retry once the file reports loaded
+    }
+
+    func reportRenderFailure(_ reason: String) {
+        lastError = "渲染层: \(reason)"
     }
 
     func setSpeed(_ speed: Double) {

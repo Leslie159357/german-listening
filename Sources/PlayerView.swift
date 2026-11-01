@@ -15,6 +15,7 @@ struct PlayerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            videoSurface
             statusBar
             currentSentenceCard
             controls
@@ -46,6 +47,20 @@ struct PlayerView: View {
     }
 
     // MARK: - Subviews
+
+    @ViewBuilder
+    private var videoSurface: some View {
+        if let handle = engine.rawHandle {
+            MPVSurface(handle: handle) { reason in
+                engine.reportRenderFailure(reason)
+            }
+            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+            .background(Color.black)
+        } else {
+            Rectangle().fill(Color.black).aspectRatio(16.0 / 9.0, contentMode: .fit)
+                .overlay(Text("引擎未就绪").foregroundStyle(.white.secondary))
+        }
+    }
 
     private var statusBar: some View {
         HStack {
@@ -182,4 +197,19 @@ struct SentenceListView: View, Equatable {
         }
         .listStyle(.plain)
     }
+}
+
+
+/// Bridges the Objective-C render view into SwiftUI.
+struct MPVSurface: UIViewRepresentable {
+    let handle: UnsafeMutableRawPointer
+    let onFailure: (String) -> Void
+
+    func makeUIView(context: Context) -> MPVRenderView {
+        let view = MPVRenderView(frame: .zero, mpvHandle: handle)
+        view.onFailure = onFailure
+        return view
+    }
+
+    func updateUIView(_ uiView: MPVRenderView, context: Context) {}
 }
