@@ -141,6 +141,20 @@ final class LibraryStore: ObservableObject {
         return item
     }
 
+    /// Handles a file handed over by another app (115, Files, Mail, AirDrop).
+    /// The URL is security-scoped and dies with this call, so copy immediately.
+    @discardableResult
+    func handleIncoming(_ url: URL) -> MediaItem? {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            return try importMedia(from: url, candidates: [])
+        } catch {
+            lastError = "接收文件失败：\(error.localizedDescription)"
+            return nil
+        }
+    }
+
     /// Picks up anything the user dropped into the app's Documents folder via the Files app,
     /// plus same-named subtitles, and imports it into the library.
     func scanDocumentsFolder() {

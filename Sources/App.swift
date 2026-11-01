@@ -8,6 +8,9 @@ struct GermanListeningApp: App {
         WindowGroup {
             LibraryView()
                 .environmentObject(store)
+                .onOpenURL { url in
+                    _ = store.handleIncoming(url)
+                }
         }
     }
 }

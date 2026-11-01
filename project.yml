@@ -30,6 +30,19 @@ targets:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Video
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.movie, public.mpeg-4, public.audiovisual-content]
+          - CFBundleTypeName: Audio
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.audio, public.mp3, public.mpeg-4-audio]
+          - CFBundleTypeName: Subtitle
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.plain-text, public.text]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: xyz.1122275.germanlistening
