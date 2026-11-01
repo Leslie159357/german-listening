@@ -10,8 +10,10 @@ struct PlayerView: View {
     @State private var speed: Double = 1.0
     @State private var hasLoaded = false
     @State private var lastSeekAt = Date.distantPast
-
-    private var sentences: [Sentence] { item.sentences }
+    @State private var sentences: [Sentence] = []
+    @State private var subtitleName: String?
+    @State private var showSubtitlePicker = false
+    @State private var subtitleNotice: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,6 +31,17 @@ struct PlayerView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
+                    Button("导入 / 更换字幕…") { showSubtitlePicker = true }
+                    if subtitleName != nil {
+                        Button("移除字幕", role: .destructive) {
+                            store.removeSubtitle(from: item.id)
+                            subtitleName = nil
+                            sentences = []
+                            subtitleNotice = "已移除字幕"
+                        }
+                    }
+                    Button(subtitleName == nil ? "当前：无字幕" : "当前：\(subtitleName!)") {}.disabled(true)
+                    Divider()
                     Button("记录视频参数") { engine.logVideoParameters() }
                     Divider()
                     Button("硬解：开") { engine.setHardwareDecoding(true) }
@@ -45,7 +58,10 @@ struct PlayerView: View {
         .task(id: item.id) {
             guard !hasLoaded else { return }
             hasLoaded = true
-            engine.load(url: store.mediaURL(for: item), startAt: item.lastPosition)
+            let current = store.item(item.id) ?? item
+            sentences = current.sentences
+            subtitleName = current.subtitleName
+            engine.load(url: store.mediaURL(for: current), startAt: current.lastPosition)
             syncIndex(time: item.lastPosition)
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             engine.logVideoParameters()
@@ -61,6 +77,30 @@ struct PlayerView: View {
         }
         .onChange(of: speed) { _, newValue in
             engine.setSpeed(newValue)
+        }
+        .sheet(isPresented: $showSubtitlePicker) {
+            DocumentPicker { urls in
+                showSubtitlePicker = false
+                guard let url = urls.first else { return }
+                let count = store.assignSubtitle(url, to: item.id)
+                if count > 0 {
+                    let updated = store.item(item.id)
+                    sentences = updated?.sentences ?? []
+                    subtitleName = updated?.subtitleName
+                    currentIndex = 0
+                    subtitleNotice = "已挂载 \(count) 句"
+                } else {
+                    subtitleNotice = store.lastError ?? "字幕没挂上"
+                    store.lastError = nil
+                }
+            }
+            .ignoresSafeArea()
+        }
+        .alert("字幕", isPresented: Binding(get: { subtitleNotice != nil },
+                                          set: { if !$0 { subtitleNotice = nil } })) {
+            Button("好", role: .cancel) { subtitleNotice = nil }
+        } message: {
+            Text(subtitleNotice ?? "")
         }
     }
 

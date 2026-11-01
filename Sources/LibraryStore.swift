@@ -301,6 +301,56 @@ final class LibraryStore: ObservableObject {
         if changed { save() }
     }
 
+    // MARK: - Manual subtitle binding (in-player import)
+
+    func item(_ id: UUID) -> MediaItem? { items.first { $0.id == id } }
+
+    /// Explicit user choice beats any guessing: the subtitle is stored under the media's own
+    /// basename so later launches keep the exact pairing, and replaces whatever was attached.
+    @discardableResult
+    func assignSubtitle(_ url: URL, to itemID: UUID) -> Int {
+        guard let index = items.firstIndex(where: { $0.id == itemID }) else { return 0 }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+
+        let ext = url.pathExtension.isEmpty ? "srt" : url.pathExtension
+        let mediaBase = (items[index].fileName as NSString).deletingPathExtension
+        let destination = mediaDir.appendingPathComponent("\(mediaBase).\(ext)")
+        if fm.fileExists(atPath: destination.path) { try? fm.removeItem(at: destination) }
+        do {
+            try fm.copyItem(at: url, to: destination)
+        } catch {
+            AppLog.shared.log("字幕复制失败：\(error.localizedDescription)")
+            lastError = "字幕复制失败：\(error.localizedDescription)"
+            return 0
+        }
+
+        let cues = (try? SubtitleParser.parse(url: destination)) ?? []
+        let sentences = SubtitleParser.sentences(from: cues)
+        guard !sentences.isEmpty else {
+            AppLog.shared.log("字幕 \(destination.lastPathComponent) 解析出 0 句")
+            lastError = "这份字幕解析不出句子（格式可能不受支持）"
+            return 0
+        }
+        items[index].subtitleName = destination.lastPathComponent
+        items[index].sentences = sentences
+        save()
+        AppLog.shared.log("手动挂载 \(destination.lastPathComponent) → \(items[index].title)，\(sentences.count) 句")
+        return sentences.count
+    }
+
+    func removeSubtitle(from itemID: UUID) {
+        guard let index = items.firstIndex(where: { $0.id == itemID }) else { return }
+        if let name = items[index].subtitleName {
+            let path = mediaDir.appendingPathComponent(name)
+            if fm.fileExists(atPath: path.path) { try? fm.removeItem(at: path) }
+            AppLog.shared.log("移除字幕 \(name)")
+        }
+        items[index].subtitleName = nil
+        items[index].sentences = []
+        save()
+    }
+
     func scanDocumentsFolder() {
         guard let entries = try? fm.contentsOfDirectory(at: documents,
                                                         includingPropertiesForKeys: nil,
