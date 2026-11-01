@@ -141,6 +141,22 @@ final class LibraryStore: ObservableObject {
         return item
     }
 
+    /// Picks up anything the user dropped into the app's Documents folder via the Files app,
+    /// plus same-named subtitles, and imports it into the library.
+    func scanDocumentsFolder() {
+        guard let entries = try? fm.contentsOfDirectory(at: documents,
+                                                        includingPropertiesForKeys: nil,
+                                                        options: [.skipsHiddenFiles]) else { return }
+        let mediaExts: Set<String> = ["mp4", "mkv", "mov", "m4v", "avi", "ts", "webm", "mp3", "m4a", "wav", "flac", "aac", "ogg"]
+        let subtitleExts: Set<String> = ["srt", "vtt", "ass", "ssa"]
+        let media = entries.filter { mediaExts.contains($0.pathExtension.lowercased()) }
+        let subs = entries.filter { subtitleExts.contains($0.pathExtension.lowercased()) }
+        guard !media.isEmpty else { return }
+        for url in media {
+            _ = try? importMedia(from: url, candidates: subs)
+        }
+    }
+
     func mediaURL(for item: MediaItem) -> URL {
         mediaDir.appendingPathComponent(item.fileName)
     }
