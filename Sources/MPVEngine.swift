@@ -82,7 +82,10 @@ final class MPVEngine: ObservableObject {
         _ = setOption("vo", "libmpv")          // render API consumer; "gpu" has no iOS context
         _ = setOption("gpu-api", "opengl")
         _ = setOption("ao", "audiounit")
-        _ = setOption("hwdec", "videotoolbox")
+        // VideoToolbox hands mpv an already-converted texture on this GLES path, and the
+        // colour matrix/range lands wrong (measured: bt.709 8-bit H.264 shifted, software
+        // decode correct). Software decode is the safe default; the wrench menu can opt in.
+        _ = setOption("hwdec", "no")
         // iPhone screen recordings are often HDR (BT.2020/PQ). Forcing a 100-nit target crushed
         // the midtones; let mpv tonemap to a normal SDR reference white instead.
         _ = setOption("tone-mapping", "auto")
