@@ -15,6 +15,7 @@ final class LibraryStore: ObservableObject {
     init() {
         try? fm.createDirectory(at: mediaDir, withIntermediateDirectories: true)
         load()
+        sanitizeSubtitleAssignments()
     }
 
     // MARK: - Persistence
@@ -124,7 +125,14 @@ final class LibraryStore: ObservableObject {
         if !fm.fileExists(atPath: destination.path) {
             guard (try? fm.copyItem(at: url, to: destination)) != nil else { return false }
         }
-        guard let index = bestMatch(forSubtitleNamed: destination.deletingPathExtension().lastPathComponent) else {
+        let subBase = destination.deletingPathExtension().lastPathComponent
+        let allMatches = items.indices.filter {
+            items[$0].subtitleName == nil
+                && items[$0].sentences.isEmpty
+                && Self.subtitleMatches(mediaBase: items[$0].title, subtitleBase: subBase)
+        }
+        guard allMatches.count == 1, let index = allMatches.first else {
+            AppLog.shared.log("字幕 \(destination.lastPathComponent) 匹配到 \(allMatches.count) 个素材，不自动挂载")
             return false
         }
         let parsed = (try? SubtitleParser.parse(url: destination)) ?? []
@@ -134,62 +142,66 @@ final class LibraryStore: ObservableObject {
         return true
     }
 
-    private func bestMatch(forSubtitleNamed subBase: String) -> Int? {
-        let key = Self.normalized(subBase)
-        if let exact = items.firstIndex(where: { Self.normalized($0.title) == key }) { return exact }
-        if let prefix = items.firstIndex(where: { item in
-            let itemKey = Self.normalized(item.title)
-            return itemKey.hasPrefix(key) || key.hasPrefix(itemKey)
-        }) { return prefix }
-        return items.count == 1 ? 0 : nil
+    /// Exact (case/diacritic-insensitive) match, or a prefix match long enough to be meaningful.
+    /// There is deliberately no "only one subtitle around" fallback: that is how one Peppa
+    /// subtitle ended up attached to every video in the library.
+    static func subtitleMatches(mediaBase: String, subtitleBase: String) -> Bool {
+        let media = normalized(mediaBase)
+        let sub = normalized(subtitleBase)
+        guard !media.isEmpty, !sub.isEmpty else { return false }
+        if media == sub { return true }
+        let shorter = media.count <= sub.count ? media : sub
+        let longer = media.count <= sub.count ? sub : media
+        return shorter.count >= 6 && longer.hasPrefix(shorter)
     }
 
-    /// Re-pairs every item that still has no subtitle against what is on disk.
+    private func subtitleNameInUse(_ name: String, excluding index: Int) -> Bool {
+        items.enumerated().contains { $0.offset != index && $0.element.subtitleName == name }
+    }
+
+    private func bestMatch(forSubtitleNamed subBase: String) -> Int? {
+        let candidates = items.indices.filter { index in
+            let item = items[index]
+            guard item.subtitleName == nil, item.sentences.isEmpty else { return false }
+            return Self.subtitleMatches(mediaBase: item.title, subtitleBase: subBase)
+        }
+        return candidates.count == 1 ? candidates[0] : nil
+    }
+
+    /// Re-pairs items that still have no subtitle against files already on disk. Only items with
+    /// neither a subtitle nor sentences are touched, and a subtitle can only serve one item.
     func repairSubtitleAssignments() {
         let subs = (try? fm.contentsOfDirectory(at: mediaDir, includingPropertiesForKeys: nil)) ?? []
         let subtitleFiles = subs.filter { isSubtitle($0) }
         guard !subtitleFiles.isEmpty else { return }
         var changed = false
-        for index in items.indices where items[index].sentences.isEmpty {
-            let key = Self.normalized(items[index].title)
-            let hit = subtitleFiles.first { Self.normalized($0.deletingPathExtension().lastPathComponent) == key }
-                ?? subtitleFiles.first { candidate in
-                    let cand = Self.normalized(candidate.deletingPathExtension().lastPathComponent)
-                    return !cand.isEmpty && (cand.hasPrefix(key) || key.hasPrefix(cand))
-                }
-                ?? (subtitleFiles.count == 1 ? subtitleFiles.first : nil)
-            guard let hit else { continue }
+        for index in items.indices {
+            guard items[index].sentences.isEmpty, items[index].subtitleName == nil else { continue }
+            let matches = subtitleFiles.filter { candidate in
+                Self.subtitleMatches(mediaBase: items[index].title,
+                                     subtitleBase: candidate.deletingPathExtension().lastPathComponent)
+                    && !subtitleNameInUse(candidate.lastPathComponent, excluding: index)
+            }
+            guard matches.count == 1, let hit = matches.first else { continue }
             let parsed = (try? SubtitleParser.parse(url: hit)) ?? []
             let sentences = SubtitleParser.sentences(from: parsed)
             guard !sentences.isEmpty else { continue }
             items[index].subtitleName = hit.lastPathComponent
             items[index].sentences = sentences
             changed = true
+            AppLog.shared.log("配对 \(hit.lastPathComponent) → \(items[index].title)，\(sentences.count) 句")
         }
         if changed { save() }
     }
 
-    private func isMedia(_ url: URL) -> Bool { !isSubtitle(url) }
-
-    /// Case/space/punctuation-insensitive key, so a hand-renamed subtitle still pairs.
-    static func normalized(_ name: String) -> String {
-        let lowered = name.lowercased().folding(options: .diacriticInsensitive, locale: .current)
-        return lowered.filter { $0.isLetter || $0.isNumber }
-    }
-
-    private func isSubtitle(_ url: URL) -> Bool {
-        ["srt", "vtt", "ass", "ssa"].contains(url.pathExtension.lowercased())
-    }
-
-    /// Copies media into the sandbox. Subtitles are looked up in the picked set first, then in Documents/Media.
+    /// Copies media into the sandbox and attaches a matching subtitle from the same selection.
+    /// Only an unambiguous match is accepted — see `subtitleMatches`.
     @discardableResult
-    func importMedia(from url: URL, candidates: [URL] = []) throws -> MediaItem? {
+    func importMedia(from url: URL, candidates: [URL]) throws -> MediaItem? {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
 
         let name = url.lastPathComponent
-        let base = url.deletingPathExtension().lastPathComponent
-
         let destination = mediaDir.appendingPathComponent(name)
         if !fm.fileExists(atPath: destination.path) {
             do {
@@ -201,68 +213,63 @@ final class LibraryStore: ObservableObject {
             }
         }
 
-        // Subtitle pairing: exact name → prefix name → the only subtitle around → give up.
-        var subtitleURL: URL?
-        let key = Self.normalized(base)
-        let matched = candidates.first { Self.normalized($0.deletingPathExtension().lastPathComponent) == key }
-            ?? candidates.first { candidate in
-                let cand = Self.normalized(candidate.deletingPathExtension().lastPathComponent)
-                return !cand.isEmpty && (cand.hasPrefix(key) || key.hasPrefix(cand))
-            }
-            ?? (candidates.count == 1 ? candidates.first : nil)
-        if let picked = matched {
-            let scopedSub = picked.startAccessingSecurityScopedResource()
-            defer { if scopedSub { picked.stopAccessingSecurityScopedResource() } }
-            let dest = mediaDir.appendingPathComponent(picked.lastPathComponent)
-            if !fm.fileExists(atPath: dest.path) { try? fm.copyItem(at: picked, to: dest) }
-            subtitleURL = dest
-        } else {
-            for ext in ["srt", "vtt", "ass", "ssa"] {
-                let candidate = mediaDir.appendingPathComponent(base).appendingPathExtension(ext)
-                if fm.fileExists(atPath: candidate.path) { subtitleURL = candidate; break }
-            }
+        let base = (name as NSString).deletingPathExtension
+        if let existing = items.firstIndex(where: { $0.fileName == name }), !items[existing].sentences.isEmpty {
+            return items[existing]     // already imported with a subtitle; do not disturb it
         }
 
+        var subtitleName: String?
         var sentences: [Sentence] = []
-        if let subtitleURL {
-            let cues = (try? SubtitleParser.parse(url: subtitleURL)) ?? []
+        let matched = candidates.filter {
+            Self.subtitleMatches(mediaBase: base,
+                                 subtitleBase: $0.deletingPathExtension().lastPathComponent)
+        }
+        if matched.count == 1, let subURL = matched.first {
+            let subScoped = subURL.startAccessingSecurityScopedResource()
+            defer { if subScoped { subURL.stopAccessingSecurityScopedResource() } }
+            let subDestination = mediaDir.appendingPathComponent(subURL.lastPathComponent)
+            if !fm.fileExists(atPath: subDestination.path) {
+                try? fm.copyItem(at: subURL, to: subDestination)
+            }
+            let cues = (try? SubtitleParser.parse(url: subDestination)) ?? []
             sentences = SubtitleParser.sentences(from: cues)
-            AppLog.shared.log("字幕 \(subtitleURL.lastPathComponent)：\(cues.count) 条 cue → \(sentences.count) 句")
+            if !sentences.isEmpty { subtitleName = subDestination.lastPathComponent }
+            AppLog.shared.log("字幕 \(subDestination.lastPathComponent)：\(cues.count) 条 cue → \(sentences.count) 句")
+        } else if matched.count > 1 {
+            AppLog.shared.log("字幕匹配到 \(matched.count) 个候选，跳过自动挂载")
         }
 
-        // Re-import refreshes the existing entry (a subtitle added later must take effect).
-        if let index = items.firstIndex(where: { $0.fileName == name }) {
-            items[index].sentences = sentences
-            items[index].subtitleName = subtitleURL?.lastPathComponent
+        if let existing = items.firstIndex(where: { $0.fileName == name }) {
+            items[existing].subtitleName = subtitleName
+            items[existing].sentences = sentences
             save()
-            return items[index]
+            return items[existing]
         }
 
-        let item = MediaItem(title: base,
-                             fileName: name,
-                             subtitleName: subtitleURL?.lastPathComponent,
-                             sentences: sentences)
+        let item = MediaItem(title: base, fileName: name, subtitleName: subtitleName, sentences: sentences)
         items.append(item)
         save()
+        AppLog.shared.log("入库 \(base)，当前 \(items.count) 条")
         return item
     }
 
-    /// Handles a file handed over by another app (115, Files, Mail, AirDrop).
-    /// The URL is security-scoped and dies with this call, so copy immediately.
-    @discardableResult
-    func handleIncoming(_ url: URL) -> MediaItem? {
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        do {
-            return try importMedia(from: url, candidates: [])
-        } catch {
-            lastError = "接收文件失败：\(error.localizedDescription)"
-            return nil
+    /// Drops attachments created by the old "only one subtitle around" rule, which glued a single
+    /// subtitle onto unrelated videos.
+    func sanitizeSubtitleAssignments() {
+        var changed = false
+        for index in items.indices {
+            guard let sub = items[index].subtitleName else { continue }
+            let subBase = (sub as NSString).deletingPathExtension
+            if !Self.subtitleMatches(mediaBase: items[index].title, subtitleBase: subBase) {
+                AppLog.shared.log("清除错误配对：\(sub) ≠ \(items[index].title)")
+                items[index].subtitleName = nil
+                items[index].sentences = []
+                changed = true
+            }
         }
+        if changed { save() }
     }
 
-    /// Picks up anything the user dropped into the app's Documents folder via the Files app,
-    /// plus same-named subtitles, and imports it into the library.
     func scanDocumentsFolder() {
         guard let entries = try? fm.contentsOfDirectory(at: documents,
                                                         includingPropertiesForKeys: nil,
