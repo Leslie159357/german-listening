@@ -33,6 +33,13 @@ private func c_mpv_free(_ data: UnsafeMutableRawPointer?)
 @_silgen_name("mpv_terminate_destroy")
 private func c_mpv_terminate_destroy(_ ctx: OpaquePointer?)
 
+/// High-frequency playback position, split out of MPVEngine so 5 Hz ticks do not
+/// invalidate every view that observes the engine.
+@MainActor
+final class PlaybackClock: ObservableObject {
+    @Published var time: Double = 0
+}
+
 enum EngineState: String {
     case idle, loading, playing, paused, failed
 }
@@ -44,7 +51,8 @@ enum EngineState: String {
 @MainActor
 final class MPVEngine: ObservableObject {
     @Published private(set) var state: EngineState = .idle
-    @Published private(set) var time: Double = 0
+    let clock = PlaybackClock()
+    var time: Double { clock.time }
     @Published private(set) var duration: Double = 0
     @Published private(set) var lastError: String?
 
@@ -75,12 +83,12 @@ final class MPVEngine: ObservableObject {
         _ = setOption("gpu-api", "opengl")
         _ = setOption("ao", "audiounit")
         _ = setOption("hwdec", "videotoolbox")
-        // iPhone screen recordings are often HDR (BT.2020/PQ); without tonemapping they render
-        // washed out or with shifted hues into an SDR framebuffer.
+        // iPhone screen recordings are often HDR (BT.2020/PQ). Forcing a 100-nit target crushed
+        // the midtones; let mpv tonemap to a normal SDR reference white instead.
         _ = setOption("tone-mapping", "auto")
-        _ = setOption("hdr-compute-peak", "no")
-        _ = setOption("target-peak", "100")
+        _ = setOption("target-peak", "203")
         _ = setOption("target-colorspace-hint", "no")
+        _ = setOption("dither-depth", "8")
         _ = setOption("audio-pitch-correction", "yes")
         _ = setOption("hr-seek", "yes")
         _ = c_mpv_request_log_messages(ctx, "warn")
@@ -199,7 +207,7 @@ final class MPVEngine: ObservableObject {
     func togglePlay() { state == .paused ? play() : pause() }
 
     func seek(to seconds: Double) {
-        time = seconds
+        clock.time = seconds
         let rc = command(["seek", String(format: "%.3f", seconds), "absolute+exact"])
         if rc < 0 { pendingSeek = seconds }
     }
@@ -211,17 +219,18 @@ final class MPVEngine: ObservableObject {
         AppLog.shared.log("硬解 → \(enabled ? "开" : "关") rc=\(rc)")
     }
 
-    func setToneMapping(_ mode: String) {
+    func setToneMapping(_ mode: String, targetPeak: Int = 203) {
         _ = setProperty("tone-mapping", mode)
-        _ = setProperty("target-peak", "100")
-        AppLog.shared.log("音调映射 → \(mode)")
+        _ = setProperty("target-peak", String(targetPeak))
+        AppLog.shared.log("音调映射 → \(mode)，target-peak=\(targetPeak)")
     }
 
     /// Dumps what mpv thinks the source is; distinguishes HDR/colour-space issues from channel swaps.
     func logVideoParameters() {
-        let keys = ["video-params/primaries", "video-params/gamma", "video-params/sig-peak",
-                    "video-params/colorlevels", "video-params/pixelformat", "video-params/w",
-                    "video-params/h", "hwdec-current", "video-codec", "colorspace"]
+        let keys = ["video-params/primaries", "video-params/gamma", "video-params/colormatrix",
+                    "video-params/sig-peak", "video-params/max-luma", "video-params/colorlevels",
+                    "video-params/pixelformat", "video-params/hw-pixelformat",
+                    "video-params/w", "video-params/h", "hwdec-current", "video-codec"]
         let summary = keys.map { "\($0)=\(Self.readPropertyString($0) ?? "-")" }.joined(separator: " ")
         AppLog.shared.log("视频参数 " + summary)
     }
@@ -231,6 +240,18 @@ final class MPVEngine: ObservableObject {
     private static func readPropertyString(_ name: String) -> String? {
         guard let handle = sharedHandle else { return nil }
         return readProperty(handle, name)
+    }
+
+    /// mpv-native A/B loop: boundary precision comes from the decoder, not from a 5 Hz poll.
+    func setLoop(start: Double, end: Double) {
+        _ = setProperty("ab-loop-a", String(format: "%.3f", start))
+        _ = setProperty("ab-loop-b", String(format: "%.3f", end))
+        AppLog.shared.log("循环 \(String(format: "%.2f", start))–\(String(format: "%.2f", end))")
+    }
+
+    func clearLoop() {
+        _ = setProperty("ab-loop-a", "no")
+        _ = setProperty("ab-loop-b", "no")
     }
 
     func setSpeed(_ speed: Double) {
@@ -265,9 +286,9 @@ final class MPVEngine: ObservableObject {
     }
 
     private func apply(pos: Double?, duration newDuration: Double?, paused: Bool) {
-        if let pos { time = pos }
+        if let pos { clock.time = pos }
         if let newDuration, newDuration > 0 { duration = newDuration }
-        if let pendingSeek, time > 0 {
+        if let pendingSeek, clock.time > 0 {
             _ = command(["seek", String(format: "%.3f", pendingSeek), "absolute+exact"])
             self.pendingSeek = nil
         }

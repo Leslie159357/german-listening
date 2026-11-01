@@ -39,6 +39,7 @@ extern void mpv_render_context_free(mpv_render_context *ctx);
 extern void mpv_render_context_report_swap(mpv_render_context *ctx);
 
 static const char *kMPVRenderAPITypeOpenGL = "opengl";
+static void *kRenderQueueKey = &kRenderQueueKey;
 
 static void mpvRenderUpdate(void *cb_ctx);
 
@@ -52,12 +53,26 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
     return NULL;
 }
 
+/// mpv keeps the callback context across threads and knows nothing about ARC, so it gets a
+/// retained box instead of a bare view pointer. Bridging a raw pointer to __weak would read
+/// the isa pointer of already-freed memory — a crash, or worse, a revived zombie object.
+@interface MPVRenderRef : NSObject
+@property (nonatomic, strong) MPVRenderView *view;
+@end
+
+@implementation MPVRenderRef
+@end
+
 @interface MPVRenderView () {
     BOOL _setupTried;
 }
 - (void)drawFrame;
 - (void)setupGL;
-- (void)resizeDrawable;
+- (void)setupGLIfNeeded;
+- (void)resizeDrawableWithLayer:(CAEAGLLayer *)layer;
+- (void)reportFailure:(NSString *)reason;
+- (BOOL)onRenderQueue;
+- (void)detachRendererOnRenderQueue;
 
 @property (nonatomic, assign) void *mpvHandle;
 @property (nonatomic, assign) mpv_render_context *renderContext;
@@ -66,8 +81,9 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
 @property (nonatomic, assign) GLuint colorRenderbuffer;
 @property (nonatomic, assign) CGSize pixelSize;
 @property (nonatomic, strong) dispatch_queue_t renderQueue;
-@property (nonatomic, assign) BOOL needsResize;
+@property (nonatomic, strong) MPVRenderRef *renderRef;
 @property (nonatomic, assign) BOOL ready;
+@property (nonatomic, assign) BOOL frameScheduled;
 @end
 
 @implementation MPVRenderView
@@ -81,6 +97,7 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
     if (!self) { return nil; }
     _mpvHandle = handle;
     _renderQueue = dispatch_queue_create("xyz.1122275.mpv.render", DISPATCH_QUEUE_SERIAL);
+    dispatch_queue_set_specific(_renderQueue, kRenderQueueKey, kRenderQueueKey, NULL);
     self.opaque = YES;
     self.backgroundColor = [UIColor blackColor];
     CAEAGLLayer *layer = (CAEAGLLayer *)self.layer;
@@ -96,11 +113,9 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
     [super didMoveToWindow];
     if (self.window) {
         [self setupGLIfNeeded];
-    } else {
-        // Leaving the hierarchy: stop mpv from calling back into a view that may go away.
-        if (self.renderContext) {
-            mpv_render_context_set_update_callback(self.renderContext, NULL, NULL);
-        }
+    } else if (self.renderContext) {
+        // Leaving the hierarchy: mpv must stop calling back before this view can be released.
+        mpv_render_context_set_update_callback(self.renderContext, NULL, NULL);
     }
 }
 
@@ -108,7 +123,11 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
     [super layoutSubviews];
     [self setupGLIfNeeded];
     if (!self.ready) { return; }
-    dispatch_async(self.renderQueue, ^{ [self resizeDrawable]; [self drawFrame]; });
+    CAEAGLLayer *layer = (CAEAGLLayer *)self.layer;
+    dispatch_async(self.renderQueue, ^{
+        [self resizeDrawableWithLayer:layer];
+        [self drawFrame];
+    });
 }
 
 - (void)setupGLIfNeeded {
@@ -135,11 +154,15 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
     CAEAGLLayer *layer = (CAEAGLLayer *)self.layer;
     layer.contentsScale = self.traitCollection.displayScale > 0 ? self.traitCollection.displayScale : 2.0;
     if (![self.glContext renderbufferStorage:GL_RENDERBUFFER fromDrawable:layer]) {
-        [self reportFailure:@"renderbufferStorage 失败"]; return;
+        [self reportFailure:@"renderbufferStorage 失败"];
+        [EAGLContext setCurrentContext:nil];
+        return;
     }
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, self.colorRenderbuffer);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        [self reportFailure:@"framebuffer 不完整"]; return;
+        [self reportFailure:@"framebuffer 不完整"];
+        [EAGLContext setCurrentContext:nil];
+        return;
     }
 
     mpv_opengl_init_params initParams = { mpv_get_proc_address, NULL };
@@ -152,35 +175,58 @@ static void *mpv_get_proc_address(void *ctx, const char *name) {
     int rc = mpv_render_context_create(&ctx, self.mpvHandle, params);
     if (rc < 0 || ctx == NULL) {
         [self reportFailure:[NSString stringWithFormat:@"mpv render init 失败 (rc=%d) —— 多半是 vo 不是 libmpv 或 GL 版本不足", rc]];
+        [EAGLContext setCurrentContext:nil];
         return;
     }
     self.renderContext = ctx;
 
-    __weak MPVRenderView *weakSelf = self;
-    mpv_render_context_set_update_callback(ctx, mpvRenderUpdate, (__bridge void *)weakSelf);
-    // The render queue takes over the context; do not leave it current on the main thread.
+    MPVRenderRef *ref = [MPVRenderRef new];
+    ref.view = self;
+    self.renderRef = ref;
+    mpv_render_context_set_update_callback(ctx, mpvRenderUpdate, (__bridge_retained void *)ref);
+
+    // The context belongs to the render queue from here on; the main thread lets go of it.
     self.ready = YES;
     [EAGLContext setCurrentContext:nil];
-    if (self.onReady) { self.onReady(); }
+
+    // layoutSubviews may already have run and bailed before ready; draw the first frame here.
+    CAEAGLLayer *readyLayer = layer;
+    dispatch_async(self.renderQueue, ^{
+        [self resizeDrawableWithLayer:readyLayer];
+        [self drawFrame];
+    });
+
+    if (self.onReady) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.onReady) { self.onReady(); }
+        });
+    }
 }
 
 static void mpvRenderUpdate(void *cb_ctx) {
-    // cb_ctx is unretained: resolve weakly so a dying view cannot be messaged.
-    __weak MPVRenderView *weakView = (__bridge MPVRenderView *)cb_ctx;
-    MPVRenderView *view = weakView;
-    if (!view || !view.ready || view.renderQueue == nil) { return; }
-    dispatch_async(view.renderQueue, ^{
-        MPVRenderView *strongView = weakView;
-        if (!strongView || !strongView.ready) { return; }
-        [strongView drawFrame];
+    MPVRenderRef *ref = (__bridge MPVRenderRef *)cb_ctx;
+    if (!ref) { return; }
+    MPVRenderView *view = ref.view;               // strong: the box holds the only reference
+    if (!view || !view.ready) { return; }
+    dispatch_queue_t queue = view.renderQueue;
+    if (!queue) { return; }
+    // mpv fires once per frame; without coalescing a 4K source piles frames faster than we draw.
+    @synchronized (view) {
+        if (view.frameScheduled) { return; }
+        view.frameScheduled = YES;
+    }
+    dispatch_async(queue, ^{
+        @synchronized (view) { view.frameScheduled = NO; }
+        if (!view.ready) { return; }
+        [view drawFrame];
     });
 }
 
-- (void)resizeDrawable {
-    if (!self.ready || !self.glContext) { return; }
+/// Runs on the render queue: GL calls and the drawable hand-off only.
+- (void)resizeDrawableWithLayer:(CAEAGLLayer *)layer {
+    if (!self.ready || !self.glContext || layer == nil) { return; }
     [EAGLContext setCurrentContext:self.glContext];
     glBindRenderbuffer(GL_RENDERBUFFER, self.colorRenderbuffer);
-    CAEAGLLayer *layer = (CAEAGLLayer *)self.layer;
     if (![self.glContext renderbufferStorage:GL_RENDERBUFFER fromDrawable:layer]) { return; }
     GLint width = 0, height = 0;
     glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &width);
@@ -219,25 +265,52 @@ static void mpvRenderUpdate(void *cb_ctx) {
     mpv_render_context_report_swap(self.renderContext);
 }
 
+/// May be called from the render queue, so UI callbacks hop to main.
 - (void)reportFailure:(NSString *)reason {
     self.ready = NO;
-    if (self.onFailure) { self.onFailure(reason); }
+    void (^failure)(NSString *) = self.onFailure;
+    if (!failure) { return; }
+    dispatch_async(dispatch_get_main_queue(), ^{ failure(reason); });
+}
+
+- (BOOL)onRenderQueue {
+    return dispatch_get_specific(kRenderQueueKey) == kRenderQueueKey;
 }
 
 - (void)detachRenderer {
+    if (self.renderContext == NULL && self.renderRef == nil) { return; }
+    if ([self onRenderQueue]) {
+        // Already inside a render block: a synchronous hop here would deadlock.
+        [self detachRendererOnRenderQueue];
+        return;
+    }
+    dispatch_sync(self.renderQueue, ^{ [self detachRendererOnRenderQueue]; });
+}
+
+/// Must run on the render queue so it cannot race with mpv_render_context_render.
+- (void)detachRendererOnRenderQueue {
     if (self.renderContext) {
-        [EAGLContext setCurrentContext:self.glContext];   // mpv requires the creating context to be current
+        [EAGLContext setCurrentContext:self.glContext];   // mpv needs the creating context current
         mpv_render_context_set_update_callback(self.renderContext, NULL, NULL);
         mpv_render_context_free(self.renderContext);
         self.renderContext = NULL;
+    }
+    if (self.renderRef) {
+        MPVRenderRef *ref = self.renderRef;
+        self.renderRef = nil;
+        CFRelease((__bridge CFTypeRef)ref);   // balances __bridge_retained in setupGL
     }
     self.ready = NO;
     self.mpvHandle = NULL;
 }
 
 - (void)dealloc {
-    [self detachRenderer];
-    if (_framebuffer || _colorRenderbuffer) {
+    if ([self onRenderQueue]) {
+        [self detachRendererOnRenderQueue];
+    } else if (self.renderQueue) {
+        dispatch_sync(self.renderQueue, ^{ [self detachRendererOnRenderQueue]; });
+    }
+    if ((_framebuffer || _colorRenderbuffer) && self.glContext) {
         [EAGLContext setCurrentContext:self.glContext];
         if (_framebuffer) { glDeleteFramebuffers(1, &_framebuffer); }
         if (_colorRenderbuffer) { glDeleteRenderbuffers(1, &_colorRenderbuffer); }

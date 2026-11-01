@@ -55,7 +55,7 @@ struct PlayerView: View {
             engine.pause()
             engine.shutdown()
         }
-        .onChange(of: engine.time) { _, newValue in
+        .onReceive(engine.clock.$time) { newValue in
             syncIndex(time: newValue)
             enforceLoop(time: newValue)
         }
@@ -83,7 +83,7 @@ struct PlayerView: View {
 
     private var statusBar: some View {
         HStack {
-            Text(String(format: "%.2f / %.2f", engine.time, max(engine.duration, engine.time)))
+            TimeReadout(clock: engine.clock, duration: engine.duration)
                 .font(.caption.monospacedDigit())
             Spacer()
             if let error = engine.lastError {
@@ -148,8 +148,10 @@ struct PlayerView: View {
     private func toggleLoop() {
         if loopTarget == nil {
             loopTarget = currentSentence
+            if let sentence = currentSentence { engine.setLoop(start: sentence.start, end: sentence.end) }
         } else {
             loopTarget = nil
+            engine.clearLoop()
         }
     }
 
@@ -158,7 +160,10 @@ struct PlayerView: View {
     private func jumpTo(_ index: Int) {
         guard sentences.indices.contains(index) else { return }
         currentIndex = index
-        if loopTarget != nil { loopTarget = sentences[index] }
+        if loopTarget != nil {
+            loopTarget = sentences[index]
+            engine.setLoop(start: sentences[index].start, end: sentences[index].end)
+        }
         seek(to: sentences[index].start)
     }
 
@@ -175,15 +180,8 @@ struct PlayerView: View {
         }
     }
 
-    /// Compares against the snapshot taken when looping was enabled, not the live index:
-    /// for back-to-back cues the live index has already advanced by the time the boundary is crossed.
-    private func enforceLoop(time: Double) {
-        guard let target = loopTarget else { return }
-        guard Date().timeIntervalSince(lastSeekAt) > 0.15 else { return }
-        if time >= target.end || time < target.start - 0.5 {
-            seek(to: target.start)
-        }
-    }
+    /// mpv owns the loop boundary now (ab-loop); the 5 Hz poll only keeps the UI in sync.
+    private func enforceLoop(time: Double) {}
 }
 
 /// Isolated from the 10 Hz clock updates: SwiftUI skips its diff while the index is unchanged.
@@ -238,5 +236,17 @@ struct MPVSurface: UIViewRepresentable {
 
     static func dismantleUIView(_ uiView: MPVRenderView, coordinator: ()) {
         uiView.detachRenderer()
+    }
+}
+
+
+private struct TimeReadout: View {
+    @ObservedObject var clock: PlaybackClock
+    let duration: Double
+
+    var body: some View {
+        Text(String(format: "%.2f / %.2f", clock.time, max(duration, clock.time)))
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
     }
 }
