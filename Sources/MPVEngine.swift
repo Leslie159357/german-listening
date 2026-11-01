@@ -40,6 +40,24 @@ final class PlaybackClock: ObservableObject {
     @Published var time: Double = 0
 }
 
+struct MediaTrack: Identifiable, Hashable {
+    let id: Int
+    let kind: String        // audio / sub / video
+    let language: String
+    let title: String
+    let codec: String
+    let isSelected: Bool
+
+    var label: String {
+        var parts: [String] = []
+        if !language.isEmpty { parts.append(language.uppercased()) }
+        if !title.isEmpty { parts.append(title) }
+        if parts.isEmpty { parts.append(kind == "audio" ? "音轨 \(id)" : "字幕 \(id)") }
+        if !codec.isEmpty { parts.append(codec) }
+        return parts.joined(separator: " · ")
+    }
+}
+
 enum EngineState: String {
     case idle, loading, playing, paused, failed
 }
@@ -255,6 +273,47 @@ final class MPVEngine: ObservableObject {
     func clearLoop() {
         _ = setProperty("ab-loop-a", "no")
         _ = setProperty("ab-loop-b", "no")
+    }
+
+    // MARK: - Track selection (Multi-Audio / Multi-Subs containers)
+
+    /// Reads mpv's track-list. Called after file-loaded, so every track is already enumerated.
+    func readTracks() -> [MediaTrack] {
+        guard let handle = MPVEngine.sharedHandle else { return [] }
+        guard let countText = Self.readProperty(handle, "track-list/count"),
+              let count = Int(countText), count > 0 else { return [] }
+        var tracks: [MediaTrack] = []
+        for index in 0..<count {
+            func field(_ name: String) -> String {
+                Self.readProperty(handle, "track-list/\(index)/\(name)") ?? ""
+            }
+            let kind = field("type")
+            guard kind == "audio" || kind == "sub" else { continue }
+            guard let id = Int(field("id")) else { continue }
+            tracks.append(MediaTrack(id: id,
+                                     kind: kind,
+                                     language: field("lang"),
+                                     title: field("title"),
+                                     codec: field("codec"),
+                                     isSelected: field("selected") == "yes"))
+        }
+        return tracks
+    }
+
+    func select(track: MediaTrack) {
+        _ = setProperty(track.kind == "audio" ? "aid" : "sid", String(track.id))
+        AppLog.shared.log("切换\(track.kind == "audio" ? "音轨" : "字幕轨") → \(track.label)")
+    }
+
+    func disableSubtitles() {
+        _ = setProperty("sid", "no")
+        AppLog.shared.log("关闭内置字幕轨")
+    }
+
+    func readAudioChain() -> String {
+        guard let handle = MPVEngine.sharedHandle else { return "-" }
+        let keys = ["aid", "sid", "current-ao", "audio-codec-name", "audio-params/channel-count"]
+        return keys.map { "\($0)=\(Self.readProperty(handle, $0) ?? "-")" }.joined(separator: " ")
     }
 
     func setSpeed(_ speed: Double) {

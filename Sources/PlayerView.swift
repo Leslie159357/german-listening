@@ -14,6 +14,7 @@ struct PlayerView: View {
     @State private var subtitleName: String?
     @State private var showSubtitlePicker = false
     @State private var subtitleNotice: String?
+    @State private var tracks: [MediaTrack] = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -31,6 +32,34 @@ struct PlayerView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
+                    if !audioTracks.isEmpty {
+                        Section("音轨") {
+                            ForEach(audioTracks) { track in
+                                Button {
+                                    engine.select(track: track)
+                                    refreshTracks()
+                                } label: {
+                                    Label(track.label + (track.isSelected ? " ✓" : ""),
+                                          systemImage: track.isSelected ? "checkmark.circle.fill" : "speaker.wave.2")
+                                }
+                            }
+                        }
+                    }
+                    if !subtitleTracks.isEmpty {
+                        Section("容器内字幕") {
+                            ForEach(subtitleTracks) { track in
+                                Button {
+                                    engine.select(track: track)
+                                    refreshTracks()
+                                } label: {
+                                    Label(track.label + (track.isSelected ? " ✓" : ""),
+                                          systemImage: track.isSelected ? "checkmark.circle.fill" : "captions.bubble")
+                                }
+                            }
+                            Button("关闭内置字幕") { engine.disableSubtitles(); refreshTracks() }
+                        }
+                    }
+                    Divider()
                     Button("导入 / 更换字幕…") { showSubtitlePicker = true }
                     if subtitleName != nil {
                         Button("移除字幕", role: .destructive) {
@@ -65,6 +94,12 @@ struct PlayerView: View {
             syncIndex(time: item.lastPosition)
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             engine.logVideoParameters()
+            refreshTracks()
+            AppLog.shared.log("音频链 \(engine.readAudioChain())")
+            for _ in 0..<6 where tracks.isEmpty {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                refreshTracks()
+            }
         }
         .onDisappear {
             store.updatePosition(item.id, position: engine.time)
@@ -177,6 +212,14 @@ struct PlayerView: View {
             .padding(.horizontal)
         }
         .padding(.vertical, 8)
+    }
+
+    private var audioTracks: [MediaTrack] { tracks.filter { $0.kind == "audio" } }
+    private var subtitleTracks: [MediaTrack] { tracks.filter { $0.kind == "sub" } }
+
+    private func refreshTracks() {
+        let found = engine.readTracks()
+        if !found.isEmpty { tracks = found }
     }
 
     private var currentSentence: Sentence? {
