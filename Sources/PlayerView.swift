@@ -15,6 +15,7 @@ struct PlayerView: View {
     @State private var showSubtitlePicker = false
     @State private var subtitleNotice: String?
     @State private var tracks: [MediaTrack] = []
+    @State private var settingsOpen = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -31,56 +32,10 @@ struct PlayerView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    if !audioTracks.isEmpty {
-                        Section("音轨") {
-                            ForEach(audioTracks) { track in
-                                Button {
-                                    engine.select(track: track)
-                                    refreshTracks()
-                                } label: {
-                                    Label(track.label + (track.isSelected ? " ✓" : ""),
-                                          systemImage: track.isSelected ? "checkmark.circle.fill" : "speaker.wave.2")
-                                }
-                            }
-                        }
-                    }
-                    if !subtitleTracks.isEmpty {
-                        Section("容器内字幕") {
-                            ForEach(subtitleTracks) { track in
-                                Button {
-                                    engine.select(track: track)
-                                    refreshTracks()
-                                } label: {
-                                    Label(track.label + (track.isSelected ? " ✓" : ""),
-                                          systemImage: track.isSelected ? "checkmark.circle.fill" : "captions.bubble")
-                                }
-                            }
-                            Button("关闭内置字幕") { engine.disableSubtitles(); refreshTracks() }
-                        }
-                    }
-                    Divider()
-                    Button("导入 / 更换字幕…") { showSubtitlePicker = true }
-                    if subtitleName != nil {
-                        Button("移除字幕", role: .destructive) {
-                            store.removeSubtitle(from: item.id)
-                            subtitleName = nil
-                            sentences = []
-                            subtitleNotice = "已移除字幕"
-                        }
-                    }
-                    Button(subtitleName == nil ? "当前：无字幕" : "当前：\(subtitleName!)") {}.disabled(true)
-                    Divider()
-                    Button("记录视频参数") { engine.logVideoParameters() }
-                    Divider()
-                    Button("硬解：开") { engine.setHardwareDecoding(true) }
-                    Button("硬解：关") { engine.setHardwareDecoding(false) }
-                    Divider()
-                    Button("音调映射：自动") { engine.setToneMapping("auto") }
-                    Button("音调映射：裁剪") { engine.setToneMapping("clip") }
-                    Button("音调映射：关闭") { engine.setToneMapping("no") }
+                Button {
+                    settingsOpen = true
                 } label: {
-                    Image(systemName: "wrench.and.screwdriver")
+                    Image(systemName: "slider.horizontal.3")
                 }
             }
         }
@@ -94,6 +49,9 @@ struct PlayerView: View {
             syncIndex(time: item.lastPosition)
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             engine.logVideoParameters()
+            refreshTracks()
+            engine.preferGermanAudio()
+            engine.preferGermanEmbeddedSubtitle()
             refreshTracks()
             AppLog.shared.log("音频链 \(engine.readAudioChain())")
             for _ in 0..<6 where tracks.isEmpty {
@@ -112,6 +70,24 @@ struct PlayerView: View {
         }
         .onChange(of: speed) { _, newValue in
             engine.setSpeed(newValue)
+        }
+        .sheet(isPresented: $settingsOpen) {
+            PlayerSettingsSheet(engine: engine,
+                                tracks: $tracks,
+                                subtitleName: subtitleName,
+                                onImportSubtitle: {
+                                    settingsOpen = false
+                                    showSubtitlePicker = true
+                                },
+                                onRemoveSubtitle: {
+                                    store.removeSubtitle(from: item.id)
+                                    subtitleName = nil
+                                    sentences = []
+                                    settingsOpen = false
+                                    subtitleNotice = "已移除字幕"
+                                },
+                                onRefresh: refreshTracks)
+                .presentationDetents([.medium, .large])
         }
         .sheet(isPresented: $showSubtitlePicker) {
             DocumentPicker { urls in
@@ -331,5 +307,86 @@ private struct TimeReadout: View {
         Text(String(format: "%.2f / %.2f", clock.time, max(duration, clock.time)))
             .font(.caption.monospacedDigit())
             .foregroundStyle(.secondary)
+    }
+}
+
+
+/// Aisten-style settings panel: everything that used to be crammed into a Menu, in a sheet
+/// that can actually scroll.
+struct PlayerSettingsSheet: View {
+    @ObservedObject var engine: MPVEngine
+    @Binding var tracks: [MediaTrack]
+    let subtitleName: String?
+    let onImportSubtitle: () -> Void
+    let onRemoveSubtitle: () -> Void
+    let onRefresh: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private var audioTracks: [MediaTrack] { tracks.filter { $0.kind == "audio" } }
+    private var subtitleTracks: [MediaTrack] { tracks.filter { $0.kind == "sub" } }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("音轨") {
+                    if audioTracks.isEmpty {
+                        Text("容器里没有解析到音轨").foregroundStyle(.secondary)
+                    }
+                    ForEach(audioTracks) { track in
+                        row(track: track, icon: "speaker.wave.2") {
+                            engine.select(track: track)
+                            onRefresh()
+                        }
+                    }
+                }
+
+                Section("容器内字幕") {
+                    if subtitleTracks.isEmpty {
+                        Text("这集没有内封字幕").foregroundStyle(.secondary)
+                    }
+                    ForEach(subtitleTracks) { track in
+                        row(track: track, icon: "captions.bubble") {
+                            engine.select(track: track)
+                            onRefresh()
+                        }
+                    }
+                    Button("关闭内置字幕") { engine.disableSubtitles(); onRefresh() }
+                }
+
+                Section("外挂字幕") {
+                    Button { onImportSubtitle() } label: { Label("导入 / 更换字幕…", systemImage: "square.and.arrow.down") }
+                    if let subtitleName {
+                        Text(subtitleName).font(.caption).foregroundStyle(.secondary)
+                        Button("移除字幕", role: .destructive) { onRemoveSubtitle() }
+                    }
+                }
+
+                Section("调试") {
+                    Button("记录视频参数") { engine.logVideoParameters() }
+                    Button("硬解：开") { engine.setHardwareDecoding(true) }
+                    Button("硬解：关") { engine.setHardwareDecoding(false) }
+                    Button("音调映射：自动") { engine.setToneMapping("auto") }
+                    Button("音调映射：裁剪") { engine.setToneMapping("clip") }
+                }
+            }
+            .navigationTitle("播放设置")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func row(track: MediaTrack, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Image(systemName: track.isSelected ? "checkmark.circle.fill" : icon)
+                    .foregroundStyle(track.isSelected ? Color.accentColor : .secondary)
+                Text(track.label).foregroundStyle(.primary)
+                Spacer()
+            }
+        }
     }
 }

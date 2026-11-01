@@ -305,6 +305,33 @@ final class MPVEngine: ObservableObject {
         AppLog.shared.log("切换\(track.kind == "audio" ? "音轨" : "字幕轨") → \(track.label)")
     }
 
+    /// German-first: a multi-audio container usually defaults to English or Japanese, which is
+    /// useless for listening practice.
+    func preferGermanAudio() {
+        let tracks = readTracks().filter { $0.kind == "audio" }
+        guard !tracks.isEmpty, !tracks.contains(where: { $0.isSelected && Self.isGerman($0) }) else { return }
+        if let german = tracks.first(where: Self.isGerman) {
+            select(track: german)
+        }
+    }
+
+    /// Embedded subtitles default to whatever the muxer flagged; show the German one or none.
+    func preferGermanEmbeddedSubtitle() {
+        let subs = readTracks().filter { $0.kind == "sub" }
+        guard !subs.isEmpty else { return }
+        if let german = subs.first(where: Self.isGerman) {
+            select(track: german)
+        } else {
+            disableSubtitles()
+        }
+    }
+
+    private static func isGerman(_ track: MediaTrack) -> Bool {
+        let lang = track.language.lowercased()
+        let title = track.title.lowercased()
+        return ["deu", "ger", "de", "german", "deutsch"].contains { lang.hasPrefix($0) || title.contains($0) }
+    }
+
     func disableSubtitles() {
         _ = setProperty("sid", "no")
         AppLog.shared.log("关闭内置字幕轨")
