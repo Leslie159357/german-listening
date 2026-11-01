@@ -146,3 +146,71 @@
 ## 5. 下一步（等确认）
 
 按 M1 开工：先做 P0-3（链接导入）与 P1-1（渲染队列），因为这两条直接决定你现在能不能用得上。
+
+
+---
+
+# 修订 v2（3.8 审阅后，2026-11-01）
+
+3.8 判定原计划「不能直接开工」，以下为采纳后的改动。原条目未删除，冲突处以此为准。
+
+## 改 1 · 字幕上屏改用 SwiftUI 文本层（推翻 P2 原方案）
+
+- libass 只保留给「用户导入 .ass 原样式素材」这一种场景，不做主力
+- 主力是 SwiftUI 文本层：原生 hit-test（点词才可能）、双语两行、系统字体、当前句高亮零闪烁
+- 理由：libass 输出像素，P4 点词必须反推排版几何；先建再拆是纯浪费
+- libass 若用：`secondary-sid` 双轨（0.36+），字体用 `CTFontManagerRegisterFontsForURL` 注册，`sub-fonts-dir` 在 iOS 上无效；`sub-auto=no` 必须显式关掉，否则和 App 自己挂的轨叠成双份
+
+## 改 2 · 引擎必须成为 App 级单例（P1 前置）
+
+- `MPVEngine` 从 `PlayerView` 的 `@StateObject` 提升为 App 级单例，播放页只做绑定
+- 后台策略：切后台停视频链（`vid=no`）、保留音频；回前台按 time-pos 重建
+- 不做这一步，P1-5「后台续播 + 锁屏控制」是空头，退出播放页就销毁内核
+
+## 改 3 · 句子稳定 ID（P4 前置）
+
+- 键 = `mediaID + 起始时间(ms) + 文本 hash`，替换随机 UUID
+- 否则补挂字幕/调时间轴后，生词与 Anki 卡片全部悬空
+
+## 改 4 · 单文件双语拆分（新增 P0-6）
+
+- 主流素材形态是「同一 cue 第一行德语、第二行中文」
+- 现状 `flush()` 用空格把两行拼成一句 → 双轨/译文/点词全废
+- 拆分规则：cue 内按行判断 CJK 占比，中文行进 `translation`，德语行进 `text`
+
+## 改 5 · 测量设施（新增 P0-0，所有验收门的前提）
+
+- 内置 metrics 导出：`/Documents/metrics/<gateId>.json`，字段 `gateId/device/os/build/samples/p50/p95/pass`
+- `pass` 由代码按阈值算，不接受人工填写；Debug HUD 长按标题 5 次导出 zip
+- 没有这层，本文档第 3 节的门一条都无法机械判定
+
+## 改 6 · ASR 按 RTF 重写（P5）
+
+- 模型上限 ≤300MB：`small-q5_1`(181MiB) 可用；medium(514MiB)、turbo(547MiB) 移出默认
+- 门：RTF ≤ 0.5（10 分钟音频 ≤5 分钟转完），A17 Pro + 一台 A15 都要测
+- 删除「后台转写」：iOS 后台约 30 秒窗口，改为前台常亮 + 30 秒分块 + 断点落盘
+- 校验门改成外部可核对：单调/无重叠 100%、≤20 词 100%、覆盖音频 ≥95%、与官方 SRT 对拍 CER
+
+## 改 7 · 跟读评分（P3-5）
+
+- 不用 MFCC+DTW（无阈值、无现成实现）
+- 用 `SFSpeechRecognizer(requiresOnDeviceRecognition, de-DE)` 词级时间戳 + `voiceAnalytics`(jitter/shimmer/pitch) + 词命中率，三项合成
+- 门：5 条 fixture（正确/漏词/2x/0.5x/静音）分类 5/5，静音返回 noSpeech
+
+## 改 8 · 权限与配置
+
+- 已补 `NSMicrophoneUsageDescription`、`NSSpeechRecognitionUsageDescription`
+- `Package.resolved` 必须入库并与 `exactVersion: 0.41.0` 一致（脚本断言）
+- 文档口径与 workflow 对齐：实际 runner 是 `macos-26`
+
+## 改 9 · 其他已确认遗漏
+
+- 音频素材（mp3/m4a/wav）走渲染视图会黑屏等帧 → 纯音频时不挂 render surface
+- `.ass/.ssa` 已声明但解析器只认 `-->` → 导入 ass 得 0 句且无提示，需明确提示或拒绝
+- 导入后做容器探测（codec/duration），避免 HEVC/损坏文件到播放时才炸
+- `Documents/Media` 加 `isExcludedFromBackup`，防止几 GB 视频进 iCloud 备份
+- 切句占位串 `#1/#2` 会污染生词与 Anki → 禁止占位文本进入句库
+
+## 工期修订
+
+原估 ~15 天 → 3.8 评估 ~25 天。apkg 生成拆到二期，v1 先出 CSV + 音频文件（Anki 桌面端可直接导入）。
