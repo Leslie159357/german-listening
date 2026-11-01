@@ -6,8 +6,9 @@ struct PlayerView: View {
     @StateObject private var engine = MPVEngine()
 
     @State private var currentIndex = 0
-    @State private var loopSentence = false
+    @State private var loopTarget: Sentence?      // snapshot: the loop must not follow the playhead
     @State private var speed: Double = 1.0
+    @State private var hasLoaded = false
     @State private var lastSeekAt = Date.distantPast
 
     private var sentences: [Sentence] { item.sentences }
@@ -17,30 +18,45 @@ struct PlayerView: View {
             statusBar
             currentSentenceCard
             controls
-            sentenceList
+            SentenceListView(sentences: sentences,
+                             currentIndex: currentIndex,
+                             onSelect: { jumpTo($0) })
+                .equatable()
         }
         .navigationTitle(item.title)
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear {
+        .task(id: item.id) {
+            guard !hasLoaded else { return }
+            hasLoaded = true
             engine.load(url: store.mediaURL(for: item), startAt: item.lastPosition)
-            syncIndex()
+            syncIndex(time: item.lastPosition)
         }
         .onDisappear {
             store.updatePosition(item.id, position: engine.time)
             engine.pause()
+            engine.shutdown()
         }
         .onChange(of: engine.time) { _, newValue in
             syncIndex(time: newValue)
             enforceLoop(time: newValue)
         }
+        .onChange(of: speed) { _, newValue in
+            engine.setSpeed(newValue)
+        }
     }
+
+    // MARK: - Subviews
 
     private var statusBar: some View {
         HStack {
             Text(String(format: "%.2f / %.2f", engine.time, max(engine.duration, engine.time)))
                 .font(.caption.monospacedDigit())
             Spacer()
-            Text(engine.state.rawValue).font(.caption).foregroundStyle(.secondary)
+            if let error = engine.lastError {
+                Text(error).font(.caption2).foregroundStyle(.red).lineLimit(1)
+            } else {
+                Text(engine.state.rawValue).font(.caption).foregroundStyle(.secondary)
+            }
         }
         .padding(.horizontal)
         .padding(.vertical, 6)
@@ -48,10 +64,10 @@ struct PlayerView: View {
 
     private var currentSentenceCard: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(sentences.indices.contains(currentIndex) ? sentences[currentIndex].text : "—")
+            Text(currentSentence?.text ?? "—")
                 .font(.title3)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            if let translation = sentences.indices.contains(currentIndex) ? sentences[currentIndex].translation : nil {
+            if let translation = currentSentence?.translation {
                 Text(translation).font(.subheadline).foregroundStyle(.secondary)
             }
         }
@@ -66,12 +82,12 @@ struct PlayerView: View {
         VStack(spacing: 12) {
             HStack(spacing: 16) {
                 Button { jump(-1) } label: { Image(systemName: "chevron.left.2") }
-                Button { togglePlay() } label: {
+                Button { engine.togglePlay() } label: {
                     Image(systemName: engine.state == .paused ? "play.fill" : "pause.fill")
                         .font(.title2)
                 }
-                Button { loopSentence.toggle() } label: {
-                    Image(systemName: loopSentence ? "repeat.1.circle.fill" : "repeat.1.circle")
+                Button { toggleLoop() } label: {
+                    Image(systemName: loopTarget == nil ? "repeat.1.circle" : "repeat.1.circle.fill")
                 }
                 Button { jump(1) } label: { Image(systemName: "chevron.right.2") }
             }
@@ -80,9 +96,7 @@ struct PlayerView: View {
 
             HStack {
                 Text("0.5×").font(.caption2)
-                Slider(value: $speed, in: 0.5...1.5, step: 0.05) { _ in
-                    engine.setSpeed(speed)
-                }
+                Slider(value: $speed, in: 0.5...1.5, step: 0.05)
                 Text("1.5×").font(.caption2)
                 Text(String(format: "%.2f×", speed)).font(.caption.monospacedDigit())
             }
@@ -91,28 +105,18 @@ struct PlayerView: View {
         .padding(.vertical, 8)
     }
 
-    private var sentenceList: some View {
-        List {
-            ForEach(Array(sentences.enumerated()), id: \.element.id) { index, sentence in
-                HStack(alignment: .top, spacing: 8) {
-                    Text(String(format: "%.1f", sentence.start))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .frame(width: 44, alignment: .leading)
-                    Text(sentence.text).font(.subheadline)
-                        .foregroundStyle(index == currentIndex ? .primary : .secondary)
-                }
-                .contentShape(Rectangle())
-                .onTapGesture { jumpTo(index) }
-            }
-        }
-        .listStyle(.plain)
+    private var currentSentence: Sentence? {
+        sentences.indices.contains(currentIndex) ? sentences[currentIndex] : nil
     }
 
     // MARK: - Actions
 
-    private func togglePlay() {
-        if engine.state == .paused { engine.play() } else { engine.pause() }
+    private func toggleLoop() {
+        if loopTarget == nil {
+            loopTarget = currentSentence
+        } else {
+            loopTarget = nil
+        }
     }
 
     private func jump(_ delta: Int) { jumpTo(currentIndex + delta) }
@@ -120,6 +124,7 @@ struct PlayerView: View {
     private func jumpTo(_ index: Int) {
         guard sentences.indices.contains(index) else { return }
         currentIndex = index
+        if loopTarget != nil { loopTarget = sentences[index] }
         seek(to: sentences[index].start)
     }
 
@@ -131,18 +136,50 @@ struct PlayerView: View {
     private func syncIndex(time: Double? = nil) {
         guard !sentences.isEmpty else { return }
         let now = time ?? engine.time
-        if let found = store.sentence(at: now, in: item)?.index, found != currentIndex {
+        if let found = sentences.lastIndex(where: { $0.start <= now }), found != currentIndex {
             currentIndex = found
         }
     }
 
-    /// Re-entrancy guard: mpv fires time updates while a seek is still settling.
+    /// Compares against the snapshot taken when looping was enabled, not the live index:
+    /// for back-to-back cues the live index has already advanced by the time the boundary is crossed.
     private func enforceLoop(time: Double) {
-        guard loopSentence, sentences.indices.contains(currentIndex) else { return }
+        guard let target = loopTarget else { return }
         guard Date().timeIntervalSince(lastSeekAt) > 0.15 else { return }
-        let sentence = sentences[currentIndex]
-        if time >= sentence.end || time < sentence.start - 0.3 {
-            seek(to: sentence.start)
+        if time >= target.end || time < target.start - 0.5 {
+            seek(to: target.start)
         }
+    }
+}
+
+/// Isolated from the 10 Hz clock updates: SwiftUI skips its diff while the index is unchanged.
+struct SentenceListView: View, Equatable {
+    let sentences: [Sentence]
+    let currentIndex: Int
+    let onSelect: (Int) -> Void
+
+    static func == (lhs: SentenceListView, rhs: SentenceListView) -> Bool {
+        lhs.currentIndex == rhs.currentIndex
+            && lhs.sentences.count == rhs.sentences.count
+            && lhs.sentences.first?.id == rhs.sentences.first?.id
+    }
+
+    var body: some View {
+        List {
+            ForEach(Array(sentences.enumerated()), id: \.element.id) { index, sentence in
+                HStack(alignment: .top, spacing: 8) {
+                    Text(String(format: "%.1f", sentence.start))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(width: 44, alignment: .leading)
+                    Text(sentence.text)
+                        .font(.subheadline)
+                        .foregroundStyle(index == currentIndex ? .primary : .secondary)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { onSelect(index) }
+            }
+        }
+        .listStyle(.plain)
     }
 }

@@ -5,12 +5,12 @@ import Combine
 final class LibraryStore: ObservableObject {
     @Published private(set) var items: [MediaItem] = []
     @Published private(set) var words: [WordEntry] = []
+    @Published var lastError: String?
 
     private let fm = FileManager.default
     private var documents: URL { fm.urls(for: .documentDirectory, in: .userDomainMask)[0] }
     private var mediaDir: URL { documents.appendingPathComponent("Media", isDirectory: true) }
     private var libraryURL: URL { documents.appendingPathComponent("library.json") }
-    private var wordsURL: URL { documents.appendingPathComponent("words.json") }
 
     init() {
         try? fm.createDirectory(at: mediaDir, withIntermediateDirectories: true)
@@ -20,57 +20,121 @@ final class LibraryStore: ObservableObject {
     // MARK: - Persistence
 
     private struct Snapshot: Codable {
+        var schemaVersion: Int? = 1
         var items: [MediaItem]
         var words: [WordEntry]
+
+        enum CodingKeys: String, CodingKey { case schemaVersion, items, words }
+
+        init(items: [MediaItem], words: [WordEntry]) {
+            self.items = items
+            self.words = words
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion)
+            items = (try? container.decode([MediaItem].self, forKey: .items)) ?? []
+            words = (try? container.decode([WordEntry].self, forKey: .words)) ?? []
+        }
     }
 
     private func load() {
-        if let data = try? Data(contentsOf: libraryURL),
-           let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data) {
+        guard let data = try? Data(contentsOf: libraryURL) else { return }
+        do {
+            let snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
             items = snapshot.items
             words = snapshot.words
+        } catch {
+            // Never silently start empty: keep the damaged file so the data is recoverable.
+            let stamp = Int(Date().timeIntervalSince1970)
+            let backup = documents.appendingPathComponent("library.corrupt-\(stamp).json")
+            try? fm.moveItem(at: libraryURL, to: backup)
+            lastError = "库文件损坏，已备份为 \(backup.lastPathComponent)"
         }
     }
 
     private func save() {
-        let snapshot = Snapshot(items: items, words: words)
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        // Refuse to overwrite a non-empty library with an empty one (a failed load must not wipe data).
+        if items.isEmpty, let existing = try? Data(contentsOf: libraryURL), existing.count > 64 { return }
+        guard let data = try? JSONEncoder().encode(Snapshot(items: items, words: words)) else { return }
         try? data.write(to: libraryURL, options: .atomic)
     }
 
     // MARK: - Import
 
-    /// Copies the media into the sandbox and pairs a same-named .srt/.vtt if present.
+    /// Imports the selected URLs. Subtitles can be selected together with the media:
+    /// iOS only grants security scope to the URLs the user actually picked, so a sibling
+    /// subtitle file in the same folder is NOT readable unless it was selected too.
     @discardableResult
-    func importMedia(from url: URL) throws -> MediaItem {
+    func importSelection(_ urls: [URL]) -> [MediaItem] {
+        var imported: [MediaItem] = []
+        let mediaURLs = urls.filter { isMedia($0) }
+        let subtitleURLs = urls.filter { isSubtitle($0) }
+
+        for url in mediaURLs {
+            do {
+                if let item = try importMedia(from: url, candidates: subtitleURLs) {
+                    imported.append(item)
+                }
+            } catch {
+                lastError = "导入 \(url.lastPathComponent) 失败：\(error.localizedDescription)"
+            }
+        }
+        return imported
+    }
+
+    private func isMedia(_ url: URL) -> Bool { !isSubtitle(url) }
+
+    private func isSubtitle(_ url: URL) -> Bool {
+        ["srt", "vtt", "ass", "ssa"].contains(url.pathExtension.lowercased())
+    }
+
+    /// Copies media into the sandbox. Subtitles are looked up in the picked set first, then in Documents/Media.
+    @discardableResult
+    func importMedia(from url: URL, candidates: [URL] = []) throws -> MediaItem? {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
 
         let name = url.lastPathComponent
-        if let existing = items.first(where: { $0.fileName == name }) { return existing }
+        let base = url.deletingPathExtension().lastPathComponent
 
         let destination = mediaDir.appendingPathComponent(name)
-        if fm.fileExists(atPath: destination.path) { try? fm.removeItem(at: destination) }
-        try fm.copyItem(at: url, to: destination)
+        if !fm.fileExists(atPath: destination.path) {
+            try fm.copyItem(at: url, to: destination)
+        }
 
-        var sentences: [Sentence] = []
-        var subtitleName: String?
-        for ext in ["srt", "vtt"] {
-            let candidate = url.deletingPathExtension().appendingPathExtension(ext)
-            if fm.fileExists(atPath: candidate.path) {
-                let subtitleDest = mediaDir.appendingPathComponent(candidate.lastPathComponent)
-                if !fm.fileExists(atPath: subtitleDest.path) {
-                    try? fm.copyItem(at: candidate, to: subtitleDest)
-                }
-                sentences = SubtitleParser.sentences(from: (try? SubtitleParser.parse(url: subtitleDest)) ?? [])
-                subtitleName = candidate.lastPathComponent
-                break
+        // Subtitle pairing: picked set → sandbox folder → give up.
+        var subtitleURL: URL?
+        if let picked = candidates.first(where: { $0.deletingPathExtension().lastPathComponent == base }) {
+            let scopedSub = picked.startAccessingSecurityScopedResource()
+            defer { if scopedSub { picked.stopAccessingSecurityScopedResource() } }
+            let dest = mediaDir.appendingPathComponent(picked.lastPathComponent)
+            if !fm.fileExists(atPath: dest.path) { try? fm.copyItem(at: picked, to: dest) }
+            subtitleURL = dest
+        } else {
+            for ext in ["srt", "vtt", "ass", "ssa"] {
+                let candidate = mediaDir.appendingPathComponent(base).appendingPathExtension(ext)
+                if fm.fileExists(atPath: candidate.path) { subtitleURL = candidate; break }
             }
         }
 
-        let item = MediaItem(title: url.deletingPathExtension().lastPathComponent,
+        var sentences: [Sentence] = []
+        if let subtitleURL {
+            sentences = SubtitleParser.sentences(from: (try? SubtitleParser.parse(url: subtitleURL)) ?? [])
+        }
+
+        // Re-import refreshes the existing entry (a subtitle added later must take effect).
+        if let index = items.firstIndex(where: { $0.fileName == name }) {
+            items[index].sentences = sentences
+            items[index].subtitleName = subtitleURL?.lastPathComponent
+            save()
+            return items[index]
+        }
+
+        let item = MediaItem(title: base,
                              fileName: name,
-                             subtitleName: subtitleName,
+                             subtitleName: subtitleURL?.lastPathComponent,
                              sentences: sentences)
         items.append(item)
         save()
@@ -88,8 +152,7 @@ final class LibraryStore: ObservableObject {
     }
 
     func addWord(_ word: String, sentence: String, mediaID: UUID, position: Double) {
-        let entry = WordEntry(word: word, sentence: sentence, mediaID: mediaID, position: position)
-        words.append(entry)
+        words.append(WordEntry(word: word, sentence: sentence, mediaID: mediaID, position: position))
         save()
     }
 

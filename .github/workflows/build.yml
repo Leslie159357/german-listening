@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-26
@@ -12,16 +16,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show toolchain (list Xcodes)
+      - name: Toolchain
         run: |
-          ls /Applications | grep -i xcode || true
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
 
-      - name: Install xcodegen
-        run: brew install xcodegen
+      - name: Cache SPM checkouts
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/dd/SourcePackages
+          key: spm-${{ runner.os }}-${{ hashFiles('project.yml', 'Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
 
-      - name: Generate Xcode project
+      - name: Install xcodegen
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+        run: brew install xcodegen || brew upgrade xcodegen
+
+      - name: Generate project
         run: xcodegen generate
 
       - name: Archive (unsigned)
@@ -33,20 +46,40 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/GermanListening.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            -resultBundlePath "$RUNNER_TEMP/GermanListening.xcresult" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            -quiet
+            2>&1 | tee "$RUNNER_TEMP/build.log" | grep -E '(error:|warning:|ARCHIVE|\*\* )' || true
 
       - name: Package IPA
         run: |
           APP="$RUNNER_TEMP/GermanListening.xcarchive/Products/Applications/GermanListening.app"
-          ls -la "$(dirname "$APP")"
+          test -d "$APP" || { tail -100 "$RUNNER_TEMP/build.log"; exit 1; }
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -R "$APP" "$RUNNER_TEMP/Payload/"
           cd "$RUNNER_TEMP" && zip -qry GermanListening-unsigned.ipa Payload
-          shasum -a 256 GermanListening-unsigned.ipa
-          du -h GermanListening-unsigned.ipa
+          ls -lh GermanListening-unsigned.ipa
+          EXE="$APP/GermanListening"
+          echo "arch: $(lipo -archs "$EXE")"
+          SIZE=$(stat -f%z "$EXE")
+          echo "binary bytes: $SIZE"
+          [ "$SIZE" -gt 20000000 ] || { echo "::error::binary is ${SIZE}B — libmpv did not link"; exit 1; }
+          RESOLVED="GermanListening.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+          if [ -f "$RESOLVED" ]; then cp "$RESOLVED" "$RUNNER_TEMP/"; echo "--- Package.resolved ---"; cat "$RESOLVED"; fi
 
       - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-diagnostics
+          path: |
+            ${{ runner.temp }}/build.log
+            ${{ runner.temp }}/GermanListening.xcresult
+            ${{ runner.temp }}/Package.resolved
+          if-no-files-found: warn
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: GermanListening-ipa
           path: ${{ runner.temp }}/GermanListening-unsigned.ipa

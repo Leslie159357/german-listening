@@ -8,7 +8,7 @@ options:
 packages:
   MPVKit:
     url: https://github.com/mpvkit/MPVKit.git
-    branch: main
+    exactVersion: 0.41.0
 
 targets:
   GermanListening:
@@ -20,17 +20,11 @@ targets:
       - package: MPVKit
         product: MPVKit
     info:
-      path: Sources/Info.plist
-      properties:
-        CFBundleDisplayName: 精听
-        UIBackgroundModes: [audio]
-        UIFileSharingEnabled: true
-        LSSupportsOpeningDocumentsInPlace: true
-        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+      path: Support/Info.plist
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: xyz.1122275.germanlistening
         SWIFT_VERSION: "5.0"
-        TARGETED_DEVICE_FAMILY: "1,2"
+        TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Manual
         CODE_SIGNING_ALLOWED: NO
