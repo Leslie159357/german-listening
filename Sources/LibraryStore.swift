@@ -157,15 +157,17 @@ final class LibraryStore: ObservableObject {
             guard (try? fm.copyItem(at: url, to: destination)) != nil else { return false }
         }
         let subBase = destination.deletingPathExtension().lastPathComponent
-        let allMatches = items.indices.filter {
-            items[$0].subtitleName == nil
-                && items[$0].sentences.isEmpty
-                && Self.subtitleMatches(mediaBase: items[$0].title, subtitleBase: subBase)
-        }
-        guard allMatches.count == 1, let index = allMatches.first else {
-            AppLog.shared.log("字幕 \(destination.lastPathComponent) 匹配到 \(allMatches.count) 个素材，不自动挂载")
+        let open = items.indices
+            .filter { items[$0].subtitleName == nil && items[$0].sentences.isEmpty }
+            .map { (index: $0, base: items[$0].fileName) }
+        guard let pick = SubtitleMatcher.bestMatch(subtitle: subBase, items: open) else {
+            let near = open.filter { SubtitleMatcher.tier(media: $0.base, subtitle: subBase) != nil }
+            AppLog.shared.log(near.isEmpty
+                ? "字幕 \(destination.lastPathComponent) 没有同名素材，未挂载"
+                : "字幕 \(destination.lastPathComponent) 同时命中 \(near.count) 个素材，未挂载")
             return false
         }
+        let index = pick.index
         let parsed = (try? SubtitleParser.parse(url: destination)) ?? []
         items[index].subtitleName = destination.lastPathComponent
         items[index].sentences = SubtitleParser.sentences(from: parsed)
@@ -173,17 +175,9 @@ final class LibraryStore: ObservableObject {
         return true
     }
 
-    /// Exact (case/diacritic-insensitive) match, or a prefix match long enough to be meaningful.
-    /// There is deliberately no "only one subtitle around" fallback: that is how one Peppa
-    /// subtitle ended up attached to every video in the library.
+    /// Delegates to `SubtitleMatcher`: tiered scoring, and ambiguity never resolves to a guess.
     static func subtitleMatches(mediaBase: String, subtitleBase: String) -> Bool {
-        let media = normalized(mediaBase)
-        let sub = normalized(subtitleBase)
-        guard !media.isEmpty, !sub.isEmpty else { return false }
-        if media == sub { return true }
-        let shorter = media.count <= sub.count ? media : sub
-        let longer = media.count <= sub.count ? sub : media
-        return shorter.count >= 6 && longer.hasPrefix(shorter)
+        SubtitleMatcher.tier(media: mediaBase, subtitle: subtitleBase) != nil
     }
 
     private func subtitleNameInUse(_ name: String, excluding index: Int) -> Bool {
@@ -209,7 +203,7 @@ final class LibraryStore: ObservableObject {
         for index in items.indices {
             guard items[index].sentences.isEmpty, items[index].subtitleName == nil else { continue }
             let matches = subtitleFiles.filter { candidate in
-                Self.subtitleMatches(mediaBase: items[index].title,
+                Self.subtitleMatches(mediaBase: items[index].fileName,
                                      subtitleBase: candidate.deletingPathExtension().lastPathComponent)
                     && !subtitleNameInUse(candidate.lastPathComponent, excluding: index)
             }
@@ -251,10 +245,14 @@ final class LibraryStore: ObservableObject {
 
         var subtitleName: String?
         var sentences: [Sentence] = []
-        let matched = candidates.filter {
-            Self.subtitleMatches(mediaBase: base,
-                                 subtitleBase: $0.deletingPathExtension().lastPathComponent)
+        let scored = candidates.compactMap { url -> (url: URL, tier: SubtitleMatcher.Tier)? in
+            guard let tier = SubtitleMatcher.tier(media: base,
+                                                  subtitle: url.deletingPathExtension().lastPathComponent)
+            else { return nil }
+            return (url, tier)
         }
+        let bestTier = scored.map(\.tier).min()
+        let matched = scored.filter { $0.tier == bestTier }.map(\.url)
         if matched.count == 1, let subURL = matched.first {
             let subScoped = subURL.startAccessingSecurityScopedResource()
             defer { if subScoped { subURL.stopAccessingSecurityScopedResource() } }
@@ -291,8 +289,10 @@ final class LibraryStore: ObservableObject {
         for index in items.indices {
             guard let sub = items[index].subtitleName else { continue }
             let subBase = (sub as NSString).deletingPathExtension
-            if !Self.subtitleMatches(mediaBase: items[index].title, subtitleBase: subBase) {
-                AppLog.shared.log("清除错误配对：\(sub) ≠ \(items[index].title)")
+            // Only undo clear violations — a name that cannot belong to this media — and leave
+            // everything else untouched so a user's own renaming is never silently destroyed.
+            if !Self.subtitleMatches(mediaBase: items[index].fileName, subtitleBase: subBase) {
+                AppLog.shared.log("解除不匹配的字幕：\(sub) ≠ \(items[index].title)")
                 items[index].subtitleName = nil
                 items[index].sentences = []
                 changed = true

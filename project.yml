@@ -23,8 +23,8 @@ targets:
       path: Support/Info.plist
       properties:
         CFBundleDisplayName: 精听
-        CFBundleShortVersionString: "0.13.0"
-        CFBundleVersion: "13"
+        CFBundleShortVersionString: "0.14.0"
+        CFBundleVersion: "14"
         UILaunchScreen: {}
         UIBackgroundModes: [audio]
         UIFileSharingEnabled: true
