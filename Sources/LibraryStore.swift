@@ -192,7 +192,13 @@ final class LibraryStore: ObservableObject {
 
         let destination = mediaDir.appendingPathComponent(name)
         if !fm.fileExists(atPath: destination.path) {
-            try fm.copyItem(at: url, to: destination)
+            do {
+                try fm.copyItem(at: url, to: destination)
+                AppLog.shared.log("已复制 \(name) → Media")
+            } catch {
+                AppLog.shared.log("复制失败 \(name)：\(error.localizedDescription)")
+                throw error
+            }
         }
 
         // Subtitle pairing: exact name → prefix name → the only subtitle around → give up.
@@ -219,7 +225,9 @@ final class LibraryStore: ObservableObject {
 
         var sentences: [Sentence] = []
         if let subtitleURL {
-            sentences = SubtitleParser.sentences(from: (try? SubtitleParser.parse(url: subtitleURL)) ?? [])
+            let cues = (try? SubtitleParser.parse(url: subtitleURL)) ?? []
+            sentences = SubtitleParser.sentences(from: cues)
+            AppLog.shared.log("字幕 \(subtitleURL.lastPathComponent)：\(cues.count) 条 cue → \(sentences.count) 句")
         }
 
         // Re-import refreshes the existing entry (a subtitle added later must take effect).
