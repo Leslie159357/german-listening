@@ -86,6 +86,12 @@ final class LibraryStore: ObservableObject {
 
     private func isMedia(_ url: URL) -> Bool { !isSubtitle(url) }
 
+    /// Case/space/punctuation-insensitive key, so a hand-renamed subtitle still pairs.
+    static func normalized(_ name: String) -> String {
+        let lowered = name.lowercased().folding(options: .diacriticInsensitive, locale: .current)
+        return lowered.filter { $0.isLetter || $0.isNumber }
+    }
+
     private func isSubtitle(_ url: URL) -> Bool {
         ["srt", "vtt", "ass", "ssa"].contains(url.pathExtension.lowercased())
     }
@@ -104,9 +110,16 @@ final class LibraryStore: ObservableObject {
             try fm.copyItem(at: url, to: destination)
         }
 
-        // Subtitle pairing: picked set → sandbox folder → give up.
+        // Subtitle pairing: exact name → prefix name → the only subtitle around → give up.
         var subtitleURL: URL?
-        if let picked = candidates.first(where: { $0.deletingPathExtension().lastPathComponent == base }) {
+        let key = Self.normalized(base)
+        let matched = candidates.first { Self.normalized($0.deletingPathExtension().lastPathComponent) == key }
+            ?? candidates.first { candidate in
+                let cand = Self.normalized(candidate.deletingPathExtension().lastPathComponent)
+                return !cand.isEmpty && (cand.hasPrefix(key) || key.hasPrefix(cand))
+            }
+            ?? (candidates.count == 1 ? candidates.first : nil)
+        if let picked = matched {
             let scopedSub = picked.startAccessingSecurityScopedResource()
             defer { if scopedSub { picked.stopAccessingSecurityScopedResource() } }
             let dest = mediaDir.appendingPathComponent(picked.lastPathComponent)
